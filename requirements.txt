@@ -1,0 +1,27 @@
+# ──────────────────────────────────────────
+# Requirements for the Egyptian Medical AI API
+# ──────────────────────────────────────────
+ 
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+ 
+# HTTP client (used to call Gemini)
+requests>=2.31.0
+ 
+# Data handling
+pandas>=2.2.0
+numpy>=1.26.0
+ 
+# Embeddings
+sentence-transformers>=2.7.0
+ 
+# Vector search
+faiss-cpu>=1.8.0
+ 
+# Fuzzy string matching
+rapidfuzz>=3.6.0
+ 
+# Pydantic (FastAPI dependency, pinned for compatibility)
+pydantic>=2.7.0
+ 
