@@ -26,7 +26,10 @@ def _format_assessment_summary(clinical: ClinicalPipelineResult) -> str:
 def _format_differential(clinical: ClinicalPipelineResult) -> str:
     d = clinical.differential
     if not d.possible_conditions:
-        return "لم يتم تحديد احتمالات محددة — الأعراض تحتاج متابعة."
+        return (
+            "لم يتم تحديد احتمالات محددة بعد — المعلومات الحالية غير كافية "
+            "لتشخيص تفريقي موثوق."
+        )
 
     lines = []
     for i, cond in enumerate(d.possible_conditions):
@@ -85,6 +88,35 @@ def _format_safety_notes(
         for adv in clinical.non_drug_advice:
             lines.append(f"   • {adv}")
     return "\n".join(lines) if lines else "لا توجد ملاحظات أمان إضافية."
+
+
+def format_assessment_only_response(
+    clinical: ClinicalPipelineResult,
+    full_text: str = "",
+    note: str = "",
+) -> str:
+    """Assessment + red flags only — no differential or medications."""
+    intro = clinical.patient_message_ar.strip()
+    parts = []
+    if intro:
+        parts.extend([intro, ""])
+    if note:
+        parts.extend([note, ""])
+
+    parts.extend([
+        "## 1. ملخص الحالة",
+        _format_assessment_summary(clinical),
+        "",
+        "## 2. علامات تحتاج مراجعة طبية",
+        build_red_flag_section(
+            clinical.assessment,
+            full_text,
+            clinical.differential.red_flag_assessment,
+        ),
+        "",
+        "⚠️ محتاج معلومات أكتر قبل أي تشخيص تفريقي أو اقتراح دواء.",
+    ])
+    return "\n".join(parts)
 
 
 def format_urgent_response(clinical: ClinicalPipelineResult, full_text: str = "") -> str:

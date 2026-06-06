@@ -1,7 +1,8 @@
 """Enhanced red-flag detection and medical review warnings."""
 
-from pipeline.context import normalize_text
+from pipeline.context import PatientContext, normalize_text
 from pipeline.models import ClinicalAssessment
+from pipeline.session_state import ConversationState
 
 _FEVER_KW = ["حرارة", "سخونية", "سخونيه", "حراره", "fever"]
 _RASH_KW = ["طفح", "هرش", "rash", "بقع", "احمرار"]
@@ -76,6 +77,68 @@ def detect_additional_red_flags(
             seen.add(key)
             unique.append(f)
     return unique
+
+
+def get_red_flag_screening_questions(
+    ctx: PatientContext,
+    full_text: str,
+    *,
+    session: ConversationState | None = None,
+) -> list[str]:
+    """Targeted red-flag screening before any differential diagnosis."""
+    if session and session.red_flag_screening_done:
+        return []
+
+    norm = normalize_text(full_text)
+    symptoms = " ".join(ctx.symptoms) + " " + norm
+    questions: list[str] = []
+
+    chest_kw = ["صدر", "ضغط على الصدر", "وجع صدر", "الم صدر"]
+    if any(k in symptoms for k in chest_kw):
+        if not _text_has_any(full_text, ["ضيق نفس", "نهجان", "تعرق", "كتف", "شعاع"]):
+            questions.append(
+                "هل في ضيق نفس أو تعرق أو ألم بيشع للكتف مع ألم الصدر؟"
+            )
+
+    if _text_has_any(symptoms, ["صداع", "headache"]):
+        if not _text_has_any(full_text, ["فجأة", "فجأه", "شديد جدا", "تيبس", "رقبة", "شلل", "كلام"]):
+            questions.append(
+                "هل الصداع بدأ فجأة وشديد جداً؟ أو في تيبس رقبة أو مشاكل في الكلام/الحركة؟"
+            )
+
+    if _text_has_any(symptoms, _FEVER_KW):
+        if not _text_has_any(full_text, ["طفح", "هرش", "تيبس", "رقبة", "حساسية ضوء"]):
+            if _text_has_any(symptoms, ["صداع", "رقبة", "تيبس"]):
+                questions.append(
+                    "مع الحرارة: هل في طفح جلدي، تيبس رقبة، أو حساسية من الضوء؟"
+                )
+
+    if _text_has_any(symptoms, ["بطن", "مغص", "معدة", "معده"]):
+        if not _text_has_any(full_text, ["شديد جدا", "تيبس", "ناشف", "قساوة", "قيء دم"]):
+            questions.append(
+                "هل الألم شديد جداً أو البطن ناشفة/قاسية؟ أو في قيء بالدم؟"
+            )
+
+    cough_kw = ["كحة", "كحه", "cough"]
+    if _text_has_any(symptoms, cough_kw):
+        if not _text_has_any(full_text, ["دم", "بلغم دم", "ضيق نفس", "نهجان"]):
+            questions.append(
+                "هل في دم مع الكحة أو ضيق نفس شديد معاها؟"
+            )
+
+    return questions[:2]
+
+
+def format_red_flag_screening_response(questions: list[str]) -> str:
+    lines = [
+        "قبل ما أقيّم حالتك، محتاج أتأكد من علامات الخطر:",
+        "",
+    ]
+    for i, q in enumerate(questions, 1):
+        lines.append(f"{i}. {q}")
+    lines.append("")
+    lines.append("جاوبني بوضوح — لو في أي علامة خطر، هوجّهك للطوارئ فوراً.")
+    return "\n".join(lines)
 
 
 def info_sufficient_for_red_flag_clearance(

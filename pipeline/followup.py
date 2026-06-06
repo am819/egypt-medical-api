@@ -2,8 +2,22 @@
 
 from pipeline.context import normalize_text
 from pipeline.models import ClinicalAssessment
+from pipeline.session_state import ConversationState
 
 MAX_FOLLOWUP_QUESTIONS = 3
+
+_QUESTION_KEYS = {
+    "الطفح أو الحساسية ظهرت فين": "rash_location",
+    "شكل الطفح عامل إزاي": "rash_appearance",
+    "فيه هرش أو الطفح بيتنشر": "rash_spread",
+    "الكحة جافة ولا ببلغم": "cough_type",
+    "الكحة بدأت من إمتى": "cough_duration",
+    "لو في بلغم، لونه إيه": "sputum_color",
+    "الألم فين بالظبط في البطن": "abdominal_location",
+    "شدة الألم قد إيه": "abdominal_severity",
+    "فيه أعراض تانية مع الألم": "abdominal_associated",
+    "الأعراض بدأت من إمتى": "symptom_duration",
+}
 
 _FEVER_KW = ["حرارة", "سخونية", "سخونيه", "حراره", "fever"]
 _RASH_KW = ["طفح", "هرش", "rash", "حساسية جلد", "بقع", "احمرار"]
@@ -109,8 +123,50 @@ def _general_questions(text: str, assessment: ClinicalAssessment) -> list[str]:
     return questions
 
 
-def get_followup_questions(full_text: str, assessment: ClinicalAssessment) -> list[str]:
+def _question_key(question: str) -> str:
+    for prefix, key in _QUESTION_KEYS.items():
+        if prefix in question:
+            return key
+    return question[:40]
+
+
+def _skip_already_asked(
+    questions: list[str],
+    session: ConversationState | None,
+    history: list | None,
+) -> list[str]:
+    """Drop questions the bot already asked without a useful new answer."""
+    asked_keys: set[str] = set()
+    if session:
+        asked_keys.update(session.asked_followup_keys)
+    for msg in history or []:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        for prefix, key in _QUESTION_KEYS.items():
+            if prefix in content:
+                asked_keys.add(key)
+
+    filtered: list[str] = []
+    for q in questions:
+        key = _question_key(q)
+        if key in asked_keys:
+            continue
+        filtered.append(q)
+    return filtered
+
+
+def get_followup_questions(
+    full_text: str,
+    assessment: ClinicalAssessment,
+    *,
+    history: list | None = None,
+    session: ConversationState | None = None,
+) -> list[str]:
     """Return up to 3 symptom-specific follow-up questions still unanswered."""
+    if not assessment.main_symptoms:
+        return ["إيه الأعراض اللي بتعاني منها بالظبط؟"]
+
     collected: list[str] = []
 
     if _has_fever(assessment, full_text) and _has_rash(assessment, full_text):
@@ -125,10 +181,12 @@ def get_followup_questions(full_text: str, assessment: ClinicalAssessment) -> li
     if not collected:
         collected.extend(_general_questions(full_text, assessment))
 
+    collected = _skip_already_asked(collected, session, history)
+
     seen: set[str] = set()
     unique: list[str] = []
     for q in collected:
-        key = q[:40]
+        key = _question_key(q)
         if key not in seen:
             seen.add(key)
             unique.append(q)
@@ -141,11 +199,19 @@ def information_sufficient_for_dx(
     assessment: ClinicalAssessment,
     *,
     safety_intake_done: bool = True,
+    history: list | None = None,
+    session: ConversationState | None = None,
 ) -> bool:
     """True when enough clinical detail exists to proceed to differential diagnosis."""
     if not safety_intake_done:
         return False
-    return len(get_followup_questions(full_text, assessment)) == 0
+    if not assessment.main_symptoms:
+        return False
+    if assessment.age is None or assessment.sex == "unknown":
+        return False
+    return len(get_followup_questions(
+        full_text, assessment, history=history, session=session,
+    )) == 0
 
 
 def compute_info_completeness(full_text: str, assessment: ClinicalAssessment) -> float:
@@ -162,7 +228,15 @@ def compute_info_completeness(full_text: str, assessment: ClinicalAssessment) ->
     check(assessment.age is not None)
     check(assessment.sex != "unknown")
     check(bool(assessment.main_symptoms))
-    check(bool(assessment.symptom_duration) or _text_has_any(full_text, ["يوم", "ساعة", "اسبوع"]))
+    check(bool(assessment.symptom_duration) or _text_has_any(full_text, [
+        "يوم", "ساعة", "اسبوع", "امبارح", "أمس", "دلوقتي",
+    ]))
+    check(bool(assessment.chronic_diseases) or _text_has_any(full_text, [
+        "مفيش امراض مزمن", "مفيش أمراض مزمن", "لا يوجد امراض مزمن", "سليم",
+    ]))
+    check(bool(assessment.drug_allergies) or _text_has_any(full_text, [
+        "مفيش حساس", "لا يوجد حساس", "no allerg",
+    ]))
     check(not _has_cough(assessment, full_text) or assessment.cough_type != "unknown"
           or _text_has_any(full_text, ["جاف", "ببلغم", "بلغم"]))
     check(not (_has_fever(assessment, full_text) and _has_rash(assessment, full_text))

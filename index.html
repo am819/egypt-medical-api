@@ -75,8 +75,25 @@ textarea:focus { border-color: #00c89660; }
 
 <script>
 const API = "/chat";
+const STORAGE_KEY = "egypt_medical_chat_history";
 let history = [];
 let loading = false;
+
+function loadHistory() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) history = JSON.parse(saved);
+  } catch (_) {
+    history = [];
+  }
+}
+
+function saveHistory() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+  } catch (_) {}
+}
+
 const msgsEl = document.getElementById("msgs");
 const inp = document.getElementById("inp");
 const sendBtn = document.getElementById("sendBtn");
@@ -137,6 +154,7 @@ async function send() {
     addBubble(data.response, "bot");
     history.push({ role: "user", content: msg });
     history.push({ role: "assistant", content: data.response });
+    saveHistory();
   } catch(e) {
     removeTyping();
     errEl.textContent = "خطأ في الاتصال: " + e.message;
@@ -147,12 +165,26 @@ async function send() {
   }
 }
 
+function restoreMessages() {
+  if (!history.length) return;
+  const w = msgsEl.querySelector(".welcome");
+  if (w) w.remove();
+  for (const msg of history) {
+    addBubble(msg.content, msg.role === "user" ? "user" : "bot");
+  }
+  newBtn.style.display = "block";
+}
+
 function clearChat() {
   history = [];
+  localStorage.removeItem(STORAGE_KEY);
   msgsEl.innerHTML = '<div class="welcome fadein"><div>🩺</div><strong>أهلاً بك في دكتور AI</strong><p style="margin-top:6px">احكيلي عن أعراضك — ابدأ بعمرك وجنسك</p></div>';
   errEl.textContent = "";
   newBtn.style.display = "none";
 }
+
+loadHistory();
+restoreMessages();
 </script>
 </body>
 </html>

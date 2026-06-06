@@ -10,6 +10,10 @@ from pipeline.context import (
     normalize_text,
     parse_pregnancy_breastfeeding,
 )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pipeline.session_state import ConversationState
 
 FieldStatus = Literal["unknown", "none", "reported"]
 
@@ -80,8 +84,14 @@ def _matches_any(text: str, patterns: list[str]) -> bool:
 
 
 def _bot_asked_about(history: list, query: str, keywords: list[str]) -> bool:
-    last_bot = normalize_text(last_assistant_message(history))
-    return any(normalize_text(k) in last_bot for k in keywords)
+    """True if the bot asked about this field in any recent assistant turn."""
+    for msg in reversed(history or []):
+        if msg.get("role") != "assistant":
+            continue
+        bot_text = normalize_text(msg.get("content", ""))
+        if any(normalize_text(k) in bot_text for k in keywords):
+            return True
+    return False
 
 
 def last_assistant_message(history: list) -> str:
@@ -117,27 +127,62 @@ def _field_status_reported_or_none(
     return "unknown"
 
 
+def _status_from_session_or_text(
+    session_status: FieldStatus,
+    reported_items: list,
+    full_text: str,
+    none_patterns: list[str],
+    history: list,
+    query: str,
+    bot_keywords: list[str],
+) -> FieldStatus:
+    if session_status in ("none", "reported"):
+        return session_status
+    return _field_status_reported_or_none(
+        reported_items, full_text, none_patterns,
+        history, query, bot_keywords,
+    )
+
+
 def assess_safety_intake(
     ctx: PatientContext,
     full_text: str,
     history: list,
     query: str,
+    *,
+    session: "ConversationState | None" = None,
 ) -> SafetyIntakeStatus:
-    chronic = _field_status_reported_or_none(
-        ctx.chronic_conditions, full_text, _CHRONIC_NONE_RE,
+    if session is not None:
+        fields = {
+            "age_ok": session.age is not None,
+            "sex_ok": session.sex is not None and session.sex != "unknown",
+            "chronic": session.chronic,
+            "allergies": session.allergies,
+            "medications": session.medications,
+        }
+    else:
+        fields = {
+            "age_ok": ctx.age is not None,
+            "sex_ok": ctx.sex != "unknown",
+            "chronic": "unknown",
+            "allergies": "unknown",
+            "medications": "unknown",
+        }
+    chronic = _status_from_session_or_text(
+        fields["chronic"], ctx.chronic_conditions, full_text, _CHRONIC_NONE_RE,
         history, query, _CHRONIC_BOT_KW,
     )
-    allergies = _field_status_reported_or_none(
-        ctx.allergies, full_text, _ALLERGY_NONE_RE,
+    allergies = _status_from_session_or_text(
+        fields["allergies"], ctx.allergies, full_text, _ALLERGY_NONE_RE,
         history, query, _ALLERGY_BOT_KW,
     )
-    medications = _field_status_reported_or_none(
-        ctx.current_meds, full_text, _MEDS_NONE_RE,
+    medications = _status_from_session_or_text(
+        fields["medications"], ctx.current_meds, full_text, _MEDS_NONE_RE,
         history, query, _MEDS_BOT_KW,
     )
     return SafetyIntakeStatus(
-        age_ok=ctx.age is not None,
-        sex_ok=ctx.sex != "unknown",
+        age_ok=fields["age_ok"] or ctx.age is not None,
+        sex_ok=fields["sex_ok"] or ctx.sex != "unknown",
         chronic=chronic,
         allergies=allergies,
         medications=medications,
@@ -149,8 +194,12 @@ def safety_intake_complete(
     full_text: str,
     history: list,
     query: str,
+    *,
+    session: "ConversationState | None" = None,
 ) -> bool:
-    return assess_safety_intake(ctx, full_text, history, query).complete()
+    return assess_safety_intake(
+        ctx, full_text, history, query, session=session,
+    ).complete()
 
 
 def format_safety_intake_response(status: SafetyIntakeStatus) -> str:
@@ -158,11 +207,13 @@ def format_safety_intake_response(status: SafetyIntakeStatus) -> str:
     if not missing:
         return ""
     lines = [
-        "قبل ما أقيّم حالتك أو أقترح أي دواء، محتاج أتأكد من معلومات الأمان دي:",
+        "قبل ما أقيّم حالتك أو أقترح أي دواء، محتاج أتأكد من:",
         "",
+        f"• {missing[0]}",
     ]
-    for item in missing[:5]:
-        lines.append(f"• {item}")
+    if len(missing) > 1:
+        lines.append("")
+        lines.append(f"(باقي {len(missing) - 1} سؤال أمان — هنسأل عنهم بعد ما تجاوب.)")
     lines.append("")
     lines.append("لو مفيش أمراض مزمنة / حساسية / أدوية حالية، قولّي بوضوح «مفيش».")
     return "\n".join(lines)

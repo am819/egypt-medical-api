@@ -213,12 +213,27 @@ def extract_list_after_keywords(text: str, keywords: list, check_negation: bool 
     return dedupe_keep_order(found)
 
 
+def _has_hypertension_context(norm: str) -> bool:
+    """Avoid false positives from chest pressure (ضغط على الصدر)."""
+    if re.search(r"ضغط\s*(على\s*)?الصدر|وجع\s*صدر|الم\s*صدر|صدر.*ضغط", norm):
+        return False
+    return bool(re.search(
+        r"ضغط\s*عالي|امراض\s*ضغط|مرض\s*ضغط|مريض\s*ضغط|عندي\s*ضغط|ارتفاع\s*ضغط|hypertension",
+        norm,
+    ))
+
+
 def extract_conditions(text: str) -> list:
     norm = normalize_text(text)
-    return dedupe_keep_order([
-        canonical for canonical, kws in CONDITION_KEYWORDS.items()
-        if any(k in norm for k in kws)
-    ])
+    found: list[str] = []
+    for canonical, kws in CONDITION_KEYWORDS.items():
+        if canonical == "hypertension":
+            if _has_hypertension_context(norm):
+                found.append(canonical)
+            continue
+        if any(k in norm for k in kws):
+            found.append(canonical)
+    return dedupe_keep_order(found)
 
 
 def extract_symptoms(text: str) -> list:
