@@ -1,5 +1,5 @@
 """
-api.py — Production FastAPI backend for the Egyptian Medical AI Chatbot (RAG)
+app.py — Production FastAPI backend for the Egyptian Medical AI Chatbot (RAG)
 ==============================================================================
 Extracted from the original notebook. All AI/RAG/chatbot logic is preserved
 exactly as written. Gradio and ngrok code has been removed. FastAPI endpoints
@@ -21,9 +21,9 @@ It does NOT call embed_model.encode() on the dataset — ever.
 Per-request cost: encode one short query string (~1–5 tokens).
 
 Run with:
-    uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn app:app --host 0.0.0.0 --port $PORT
 
-Required files next to api.py (generate with build_index.py):
+Required files next to app.py (generate with build_index.py):
     egypt_drugs_cleaned_utf8.csv
     faiss.index
 """
@@ -536,7 +536,7 @@ def parse_clinical_plan(raw_text: str) -> ClinicalPlan:
 # The embeddings and FAISS index are generated OFFLINE via build_index.py.
 # At startup we only do cheap file I/O — no encode() call on the dataset.
 #
-# Required files (commit to repo alongside api.py):
+# Required files (commit to repo alongside app.py):
 #   egypt_drugs_cleaned_utf8.csv  — drug database
 #   faiss.index                   — IndexFlatIP produced by build_index.py
 
@@ -940,4 +940,5 @@ def health_check():
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
