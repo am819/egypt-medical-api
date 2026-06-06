@@ -44,7 +44,6 @@ from typing import Optional, List, Dict, Any
 # ──────────────────────────────────────────────────────────────────────────────
 # AI / RAG IMPORTS
 # ──────────────────────────────────────────────────────────────────────────────
-from sentence_transformers import SentenceTransformer
 import faiss
 from rapidfuzz import process
 
@@ -74,6 +73,9 @@ GEMINI_API_KEYS: list = _load_gemini_api_keys()
 GEMINI_MODEL          = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SEC    = int(os.getenv("GEMINI_TIMEOUT_SEC", "25"))
 CHAT_TIMEOUT_SEC      = int(os.getenv("CHAT_TIMEOUT_SEC", "50"))
+# false on Railway (512MB–1GB) — loading PyTorch + the model OOM-kills the container.
+# Set ENABLE_SEMANTIC_SEARCH=true only on a host with ≥2GB RAM.
+ENABLE_SEMANTIC_SEARCH = os.getenv("ENABLE_SEMANTIC_SEARCH", "false").strip().lower() in ("1", "true", "yes")
 RPM_LIMIT             = 10
 MIN_INTERVAL          = 60.0 / RPM_LIMIT
 _last_call_time: float = 0.0
@@ -605,7 +607,8 @@ FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH",   "faiss.index")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 index:       Optional[faiss.Index]         = None
-embed_model: Optional[SentenceTransformer] = None
+embed_model: Optional[Any] = None
+_embed_load_failed: bool = False
 INGREDIENT_COL = "active_ingredient"
 df = pd.DataFrame()
 
@@ -628,9 +631,10 @@ try:
     index = faiss.read_index(FAISS_INDEX_PATH)
     print(f"✅ FAISS index loaded — {index.ntotal} vectors")
 
-    # ③ SentenceTransformer is lazy-loaded on first request (see get_embed_model())
-    #    to avoid OOM during startup on memory-constrained hosts.
-    print("✅ Startup complete — SentenceTransformer will load on first request")
+    if ENABLE_SEMANTIC_SEARCH:
+        print("✅ Startup complete — SentenceTransformer loads on first drug search")
+    else:
+        print("✅ Startup complete — drug lookup via rapidfuzz (semantic search off)")
 
 except FileNotFoundError as e:
     print(f"❌ Missing precomputed file: {e}")
@@ -693,14 +697,23 @@ def caution_notes_for_context(active_ingredient: str, ctx: PatientContext) -> li
     return dedupe_keep_order(notes)
 
 
-def get_embed_model() -> Optional[SentenceTransformer]:
-    """Lazy-load SentenceTransformer on first call to avoid startup OOM."""
-    global embed_model
-    if embed_model is None:
+def get_embed_model() -> Optional[Any]:
+    """Lazy-load SentenceTransformer on first call (skipped when ENABLE_SEMANTIC_SEARCH=false)."""
+    global embed_model, _embed_load_failed
+    if not ENABLE_SEMANTIC_SEARCH or _embed_load_failed:
+        return None
+    if embed_model is not None:
+        return embed_model
+    try:
+        from sentence_transformers import SentenceTransformer
         print(f"🔵 Loading SentenceTransformer ({EMBED_MODEL_NAME})…")
         embed_model = SentenceTransformer(EMBED_MODEL_NAME)
         print("🟢 SentenceTransformer ready")
-    return embed_model
+        return embed_model
+    except Exception as e:
+        print(f"❌ SentenceTransformer load failed — rapidfuzz fallback: {e}")
+        _embed_load_failed = True
+        return None
 
 
 def semantic_candidate_indices(query_text: str, top_k: int = 40) -> list:
@@ -1014,6 +1027,7 @@ def health_check():
         "index_loaded": index is not None,
         "drug_count": len(df) if not df.empty else 0,
         "gemini_keys_loaded": len(GEMINI_API_KEYS),
+        "semantic_search": ENABLE_SEMANTIC_SEARCH and not _embed_load_failed,
     }
 
 
