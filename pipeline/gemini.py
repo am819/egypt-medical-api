@@ -3,6 +3,7 @@
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Optional
 
 import requests
@@ -18,50 +19,18 @@ from pipeline.context import PatientContext, build_patient_summary
 from pipeline.models import ClinicalPipelineResult, clinical_pipeline_json_schema
 from pipeline.prompts import CLINICAL_PIPELINE_PROMPT, INTAKE_PROMPT, TEMPORARY_TREATMENT_NOTE
 
-# Accept Railway-style names (spaces) and standard underscore names.
-_GEMINI_KEY_ENV_ALIASES: tuple[tuple[str, ...], ...] = (
-    ("GEMINI_API_KEY", "GEMINI API KEY", "GOOGLE_API_KEY"),
-    ("GEMINI_API_KEY_2", "GEMINI API KEY 2", "GEMINI_API_KEY2"),
-    ("GEMINI_API_KEY_3", "GEMINI API KEY 3", "GEMINI_API_KEY3"),
-)
-
-
-def _first_env_value(names: tuple[str, ...]) -> str:
-    for name in names:
-        val = os.getenv(name, "").strip()
-        if val:
-            return val
-    return ""
-
-
-def _looks_like_gemini_api_key(key: str) -> bool:
-    """Google AI Studio keys start with AIza; OAuth/Vertex tokens (AQ.) won't work here."""
-    return key.startswith("AIza")
-
-
-def _load_gemini_api_keys() -> list:
-    keys: list[str] = []
-    for aliases in _GEMINI_KEY_ENV_ALIASES:
-        val = _first_env_value(aliases)
-        if not val:
-            continue
-        if not _looks_like_gemini_api_key(val):
-            print(
-                f"Skipping {aliases[0]}: expected Google AI Studio key (AIza...), "
-                f"got {val[:8]}..."
-            )
-            continue
-        keys.append(val)
-    return keys
-
-
-GEMINI_API_KEYS: list = _load_gemini_api_keys()
+GEMINI_API_KEYS = [
+    k for k in [
+        os.getenv("GEMINI_API_KEY", ""),
+        os.getenv("GEMINI_API_KEY_2", ""),
+        os.getenv("GEMINI_API_KEY_3", ""),
+    ] if k
+]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SEC = int(os.getenv("GEMINI_TIMEOUT_SEC", "25"))
-RPM_LIMIT = 10
-MIN_INTERVAL = 60.0 / RPM_LIMIT
-_last_call_time: float = 0.0
-_gemini_key_index: int = 0
+MIN_INTERVAL = 6.0  # 10 RPM per key (60s / 10)
+GEMINI_KEY_EXHAUSTED_UNTIL: list[float] = [0.0] * len(GEMINI_API_KEYS)
+_last_call_times: list[float] = [0.0] * len(GEMINI_API_KEYS)
 
 
 def _trim_history_for_gemini(history: list, max_messages: int = 10) -> list:
@@ -69,7 +38,77 @@ def _trim_history_for_gemini(history: list, max_messages: int = 10) -> list:
     return h if len(h) <= max_messages else h[-max_messages:]
 
 
-def _gemini_key_exhausted(error: dict) -> bool:
+def get_keys_status() -> list[str]:
+    now = time.time()
+    statuses: list[str] = []
+    for i in range(len(GEMINI_API_KEYS)):
+        until = GEMINI_KEY_EXHAUSTED_UNTIL[i] if i < len(GEMINI_KEY_EXHAUSTED_UNTIL) else 0.0
+        if now > until:
+            statuses.append("ready")
+        else:
+            t = datetime.fromtimestamp(until).strftime("%H:%M:%S")
+            statuses.append(f"cooldown until {t}")
+    return statuses
+
+
+def _first_available_key_index(now: float) -> Optional[int]:
+    for i in range(len(GEMINI_API_KEYS)):
+        if now > GEMINI_KEY_EXHAUSTED_UNTIL[i]:
+            return i
+    return None
+
+
+def _wait_for_next_key() -> int:
+    now = time.time()
+    key_idx = min(range(len(GEMINI_API_KEYS)), key=lambda i: GEMINI_KEY_EXHAUSTED_UNTIL[i])
+    wait = GEMINI_KEY_EXHAUSTED_UNTIL[key_idx] - now
+    if wait > 0:
+        time.sleep(wait)
+    return key_idx
+
+
+def _another_available_key(current: int) -> Optional[int]:
+    now = time.time()
+    for offset in range(1, len(GEMINI_API_KEYS)):
+        i = (current + offset) % len(GEMINI_API_KEYS)
+        if now > GEMINI_KEY_EXHAUSTED_UNTIL[i]:
+            return i
+    return None
+
+
+def _pick_key_index() -> int:
+    now = time.time()
+    key_idx = _first_available_key_index(now)
+    if key_idx is None:
+        key_idx = _wait_for_next_key()
+    return key_idx
+
+
+def _enforce_rpm(key_idx: int) -> None:
+    elapsed = time.time() - _last_call_times[key_idx]
+    if elapsed < MIN_INTERVAL:
+        time.sleep(MIN_INTERVAL - elapsed)
+
+
+def _parse_retry_after(response: requests.Response) -> float:
+    retry_hdr = response.headers.get("Retry-After") or response.headers.get("retry-after")
+    if retry_hdr:
+        try:
+            return float(retry_hdr)
+        except ValueError:
+            pass
+    return 60.0
+
+
+def _is_unavailable(response: requests.Response, error: dict) -> bool:
+    if response.status_code == 503:
+        return True
+    return str(error.get("status", "")).upper() == "UNAVAILABLE"
+
+
+def _is_rate_limit(response: requests.Response, error: dict) -> bool:
+    if response.status_code == 429:
+        return True
     code = error.get("code")
     if code in (429, 403):
         return True
@@ -84,11 +123,8 @@ def call_gemini(
     json_schema: Optional[dict[str, Any]] = None,
     max_tokens: int = 3072,
 ) -> tuple[Optional[str], str]:
-    global _last_call_time, _gemini_key_index
-    elapsed = time.time() - _last_call_time
-    if elapsed < MIN_INTERVAL:
-        time.sleep(MIN_INTERVAL - elapsed)
-
+    # Picks first key off cooldown (or waits for soonest); on 503/429 marks key exhausted and rotates.
+    # Each key enforces its own 6s RPM interval; success returns immediately.
     if not GEMINI_API_KEYS:
         print("No Gemini API keys configured (set GEMINI_API_KEY or GEMINI API KEY)")
         return None, "no_api_key"
@@ -108,36 +144,45 @@ def call_gemini(
         "generationConfig": gen_config,
     }
     n_keys = len(GEMINI_API_KEYS)
+    key_idx = _pick_key_index()
 
-    for key_attempt in range(n_keys):
-        api_key = GEMINI_API_KEYS[_gemini_key_index]
+    while True:
+        _enforce_rpm(key_idx)
+        api_key = GEMINI_API_KEYS[key_idx]
         headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
         try:
-            _last_call_time = time.time()
+            _last_call_times[key_idx] = time.time()
             r = requests.post(url, headers=headers, json=payload, timeout=GEMINI_TIMEOUT_SEC)
             resp = r.json()
             if "error" in resp:
                 err = resp["error"]
-                print(f"❌ Gemini API error (key {_gemini_key_index + 1}/{n_keys}): {err}")
-                if _gemini_key_exhausted(err) and key_attempt < n_keys - 1:
-                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
-                    print(f"🔑 Switching to Gemini API key {_gemini_key_index + 1}/{n_keys}")
+                print(f"❌ Gemini API error (key {key_idx + 1}/{n_keys}): {err}")
+                if _is_unavailable(r, err):
+                    GEMINI_KEY_EXHAUSTED_UNTIL[key_idx] = time.time() + 60
+                    print(f"🔑 Key {key_idx + 1} unavailable — cooldown 60s, rotating")
+                    key_idx = _pick_key_index()
                     continue
-                if _gemini_key_exhausted(err):
-                    return None, "rate_limit"
+                if _is_rate_limit(r, err):
+                    retry_after = _parse_retry_after(r)
+                    GEMINI_KEY_EXHAUSTED_UNTIL[key_idx] = time.time() + retry_after
+                    print(f"🔑 Key {key_idx + 1} rate-limited — cooldown {retry_after}s, rotating")
+                    key_idx = _pick_key_index()
+                    continue
                 return None, "gemini_error"
             candidates = resp.get("candidates") or []
             if not candidates:
-                print(f"❌ Gemini empty response (key {_gemini_key_index + 1}): {resp}")
-                if key_attempt < n_keys - 1:
-                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                print(f"❌ Gemini empty response (key {key_idx + 1}): {resp}")
+                other = _another_available_key(key_idx)
+                if other is not None:
+                    key_idx = other
                     continue
                 return None, "rate_limit"
             parts = candidates[0].get("content", {}).get("parts") or []
             if not parts or "text" not in parts[0]:
-                print(f"❌ Gemini missing text (key {_gemini_key_index + 1}): {resp}")
-                if key_attempt < n_keys - 1:
-                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                print(f"❌ Gemini missing text (key {key_idx + 1}): {resp}")
+                other = _another_available_key(key_idx)
+                if other is not None:
+                    key_idx = other
                     continue
                 return None, "rate_limit"
             text = parts[0]["text"].strip()
@@ -145,16 +190,15 @@ def call_gemini(
             text = re.sub(r"\(Response.*?\):\s*", "", text)
             return text, GEMINI_MODEL
         except requests.Timeout:
-            print(f"❌ Gemini timeout (key {_gemini_key_index + 1}/{n_keys})")
-            if key_attempt < n_keys - 1:
-                _gemini_key_index = (_gemini_key_index + 1) % n_keys
+            print(f"❌ Gemini timeout (key {key_idx + 1}/{n_keys})")
+            other = _another_available_key(key_idx)
+            if other is not None:
+                key_idx = other
                 continue
             return None, "rate_limit"
         except Exception as e:
-            print(f"❌ Gemini call exception (key {_gemini_key_index + 1}): {e}")
+            print(f"❌ Gemini call exception (key {key_idx + 1}): {e}")
             return None, "gemini_error"
-
-    return None, "rate_limit"
 
 
 def _build_gemini_messages(history: list, augmented: str) -> list:

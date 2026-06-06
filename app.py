@@ -23,14 +23,18 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from pipeline import dataset
-from pipeline.gemini import GEMINI_API_KEYS
+from pipeline.gemini import GEMINI_API_KEYS, get_keys_status
 from pipeline.orchestrator import rag
 
 CHAT_TIMEOUT_SEC = int(os.getenv("CHAT_TIMEOUT_SEC", "50"))
 _rag_lock = Lock()
 
 # ── Load drug dataset at startup ─────────────────────────────────────────────
-dataset.load_dataset()
+try:
+    dataset.load_dataset()
+except Exception as e:
+    print(f"❌ Startup failed (CSV/FAISS): {e}")
+    print("   App starting in degraded mode — check /health")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -94,13 +98,13 @@ async def chat_endpoint(body: ChatRequest):
 
 @app.get("/health", summary="Health check")
 def health_check():
+    degraded = dataset.index is None or dataset.df.empty
     return {
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
+        "keys_loaded": len(GEMINI_API_KEYS),
+        "keys_status": get_keys_status(),
         "index_loaded": dataset.index is not None,
-        "drug_count": len(dataset.df) if not dataset.df.empty else 0,
-        "gemini_keys_loaded": len(GEMINI_API_KEYS),
-        "semantic_search": dataset.ENABLE_SEMANTIC_SEARCH and not dataset._embed_load_failed,
-        "pipeline_version": "7-phase",
+        "drug_count": len(dataset.df),
     }
 
 

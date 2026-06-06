@@ -42,7 +42,7 @@ def _asks_for_temporary(query: str) -> bool:
 
 def _gemini_failure_message(status: str) -> str:
     if status == "rate_limit":
-        return "معلش، النظام مشغول دلوقتي — استنى شوية."
+        return "معلش، الخدمة مشغولة دلوقتي. حاول تاني بعد شوية."
     if status == "no_api_key":
         return "عذراً، مفتاح Gemini غير مُعد — راجع GEMINI_API_KEY على Railway."
     if status == "parse_error":
@@ -90,7 +90,7 @@ def _handle_needs_info(clinical, full_text, history, query, ctx, session) -> str
     return format_assessment_only_response(clinical, full_text)
 
 
-def rag(query: str, history: list) -> str:
+def _rag_inner(query: str, history: list) -> str:
     """Core RAG inference — single-pass structured clinical pipeline."""
     full_text = _full_conversation_text(query, history)
     last_bot = last_assistant_message(history)
@@ -162,3 +162,10 @@ def rag(query: str, history: list) -> str:
 
     matches, safety_notes = _finalize_matches(clinical, targets)
     return format_final_response(clinical, matches, safety_notes, full_text)
+
+
+def rag(query: str, history: list) -> str:
+    result = _rag_inner(query, history)
+    if not result or not result.strip():
+        return "معلش، الخدمة مشغولة دلوقتي. حاول تاني بعد شوية."
+    return result
