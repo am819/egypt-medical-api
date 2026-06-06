@@ -59,11 +59,21 @@ import uvicorn
 # ══════════════════════════════════════════════════════════════════════════════
 # ① GEMINI CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-RPM_LIMIT      = 10
-MIN_INTERVAL   = 60.0 / RPM_LIMIT
+def _load_gemini_api_keys() -> list:
+    keys = []
+    for env_name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"):
+        val = os.getenv(env_name, "").strip()
+        if val:
+            keys.append(val)
+    return keys
+
+
+GEMINI_API_KEYS: list = _load_gemini_api_keys()
+GEMINI_MODEL          = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+RPM_LIMIT             = 10
+MIN_INTERVAL          = 60.0 / RPM_LIMIT
 _last_call_time: float = 0.0
+_gemini_key_index: int = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -457,37 +467,70 @@ def intake_gate(ctx: PatientContext, history: list, query: str) -> Optional[str]
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑥ GEMINI API CALL
 # ══════════════════════════════════════════════════════════════════════════════
+def _gemini_key_exhausted(error: dict) -> bool:
+    code = error.get("code")
+    if code in (429, 403):
+        return True
+    status = str(error.get("status", "")).upper()
+    return "RESOURCE_EXHAUSTED" in status or "QUOTA" in status
+
+
 def call_gemini(messages: list):
-    global _last_call_time
+    global _last_call_time, _gemini_key_index
     elapsed = time.time() - _last_call_time
     if elapsed < MIN_INTERVAL:
         time.sleep(MIN_INTERVAL - elapsed)
+
+    if not GEMINI_API_KEYS:
+        print("❌ No Gemini API keys configured")
+        return None, "gemini_error"
+
     url     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-    for attempt in range(3):
-        try:
-            payload = {
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": messages,
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-            }
-            _last_call_time = time.time()
-            r    = requests.post(url, headers=headers, json=payload, timeout=45)
-            resp = r.json()
-            if "error" in resp:
-                print(f"❌ Gemini API error: {resp['error']}")
-                if resp["error"].get("code") == 429:
-                    time.sleep(10)
-                    continue
-                return None, "gemini_error"
-            text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
-            # Strip internal reasoning markers if present
-            text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
-            text = re.sub(r'\(Response.*?\):\s*', '', text)
-            return text, GEMINI_MODEL
-        except Exception as e:
-            print(f"❌ Gemini call exception (attempt {attempt+1}): {e}")
-            time.sleep(5)
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": messages,
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+    }
+    n_keys      = len(GEMINI_API_KEYS)
+    keys_tried  = 0
+    switch_key  = False
+
+    while keys_tried < n_keys:
+        api_key = GEMINI_API_KEYS[_gemini_key_index]
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+        switch_key = False
+
+        for attempt in range(3):
+            try:
+                _last_call_time = time.time()
+                r    = requests.post(url, headers=headers, json=payload, timeout=45)
+                resp = r.json()
+                if "error" in resp:
+                    err = resp["error"]
+                    print(f"❌ Gemini API error (key {_gemini_key_index + 1}/{n_keys}): {err}")
+                    if _gemini_key_exhausted(err):
+                        if attempt < 2:
+                            time.sleep(10)
+                            continue
+                        switch_key = True
+                        break
+                    return None, "gemini_error"
+                text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+                text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
+                text = re.sub(r'\(Response.*?\):\s*', '', text)
+                return text, GEMINI_MODEL
+            except Exception as e:
+                print(f"❌ Gemini call exception (key {_gemini_key_index + 1}, attempt {attempt + 1}): {e}")
+                time.sleep(5)
+
+        if not switch_key:
+            break
+
+        _gemini_key_index = (_gemini_key_index + 1) % n_keys
+        keys_tried += 1
+        if keys_tried < n_keys:
+            print(f"🔑 Switching to Gemini API key {_gemini_key_index + 1}/{n_keys}")
+
     return None, "rate_limit"
 
 
