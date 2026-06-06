@@ -5,8 +5,30 @@ Extracted from the original notebook. All AI/RAG/chatbot logic is preserved
 exactly as written. Gradio and ngrok code has been removed. FastAPI endpoints
 wrap the core `rag()` function.
 
+Startup architecture (Railway-compatible — no OOM)
+---------------------------------------------------
+Embeddings and the FAISS index are generated OFFLINE (once) using
+build_index.py, then committed to the repository as:
+
+    embeddings.npy   — float32 array, shape (N, D)
+    faiss.index      — binary FAISS IndexFlatIP file
+
+At startup this service does:
+  1. Read egypt_drugs_cleaned_utf8.csv              (~instant)
+  2. Load embeddings.npy with np.load()             (~instant, file I/O)
+  3. Load faiss.index with faiss.read_index()       (~instant, file I/O)
+  4. Load SentenceTransformer weights               (~5–15 s, once)
+
+It does NOT call embed_model.encode() on the dataset — ever.
+Per-request cost: encode one short query string (~1–5 tokens).
+
 Run with:
     uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+Required files next to api.py (generate with build_index.py):
+    egypt_drugs_cleaned_utf8.csv
+    embeddings.npy
+    faiss.index
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -17,6 +39,7 @@ import re
 import time
 import requests
 import pandas as pd
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
@@ -509,36 +532,56 @@ def parse_clinical_plan(raw_text: str) -> ClinicalPlan:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ⑦ DATASET & FAISS INDEX LOADING
+# ⑦ DATASET & INDEX LOADING  (precomputed — zero runtime encoding)
 # ══════════════════════════════════════════════════════════════════════════════
-# Paths are resolved from environment variables first, then fall back to
-# same-directory defaults — edit these if your files live elsewhere.
-CSV_PATH         = os.getenv("EGYPT_DRUGS_CSV",   "egypt_drugs_cleaned_utf8.csv")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",  "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+# The embeddings and FAISS index are generated OFFLINE via build_index.py.
+# At startup we only do cheap file I/O — no encode() call on the dataset.
+#
+# Required files (commit to repo alongside api.py):
+#   egypt_drugs_cleaned_utf8.csv  — drug database
+#   embeddings.npy                — float32 (N, D) produced by build_index.py
+#   faiss.index                   — IndexFlatIP produced by build_index.py
 
-index:       Optional[faiss.Index]             = None
-embed_model: Optional[SentenceTransformer]     = None
+CSV_PATH         = os.getenv("EGYPT_DRUGS_CSV",    "egypt_drugs_cleaned_utf8.csv")
+EMBEDDINGS_PATH  = os.getenv("EMBEDDINGS_PATH",    "embeddings.npy")
+FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH",   "faiss.index")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+index:       Optional[faiss.Index]         = None
+embed_model: Optional[SentenceTransformer] = None
 INGREDIENT_COL = "active_ingredient"
 df = pd.DataFrame()
 
 try:
+    # ① Load CSV — pure pandas, instant
     df_raw = pd.read_csv(CSV_PATH).fillna("").astype(str)
     INGREDIENT_COL = "ingredient_clean" if "ingredient_clean" in df_raw.columns else "active_ingredient"
     if "combined" not in df_raw.columns:
         df_raw["combined"] = (
-            df_raw.get("name_ar",    pd.Series([""] * len(df_raw))) + " " +
-            df_raw.get("name_en",    pd.Series([""] * len(df_raw))) + " " +
+            df_raw.get("name_ar",      pd.Series([""] * len(df_raw))) + " " +
+            df_raw.get("name_en",      pd.Series([""] * len(df_raw))) + " " +
             df_raw.get(INGREDIENT_COL, pd.Series([""] * len(df_raw)))
         )
     df = df_raw.reset_index(drop=True)
+    print(f"✅ CSV loaded — {len(df)} rows")
+
+    # ② Load precomputed embeddings — np.load(), no encode()
+    emb = np.load(EMBEDDINGS_PATH).astype("float32")
+    print(f"✅ Embeddings loaded — shape {emb.shape}")
+
+    # ③ Load precomputed FAISS index — faiss.read_index(), no rebuild
+    index = faiss.read_index(FAISS_INDEX_PATH)
+    print(f"✅ FAISS index loaded — {index.ntotal} vectors")
+
+    # ④ Load SentenceTransformer weights ONCE (used only to encode short queries)
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-    emb = embed_model.encode(df["combined"].tolist(), batch_size=256, show_progress_bar=False).astype("float32")
-    faiss.normalize_L2(emb)
-    index = faiss.IndexFlatIP(emb.shape[1])
-    index.add(emb)
-    print("✅ قاعدة البيانات و FAISS index جاهز")
+    print("✅ SentenceTransformer ready — startup complete, no dataset encoding performed")
+
+except FileNotFoundError as e:
+    print(f"❌ Missing precomputed file: {e}")
+    print("   Run build_index.py offline to generate embeddings.npy and faiss.index")
 except Exception as e:
-    print(f"❌ خطأ في تحميل البيانات: {e}")
+    print(f"❌ Startup error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -596,13 +639,35 @@ def caution_notes_for_context(active_ingredient: str, ctx: PatientContext) -> li
 
 
 def semantic_candidate_indices(query_text: str, top_k: int = 40) -> list:
-    if index is None or embed_model is None or df.empty:
-        return list(range(min(len(df), top_k)))
+    """
+    Encode query_text with SentenceTransformer (one short string, ~ms),
+    then search the preloaded FAISS index for the top_k nearest neighbours.
+
+    This is full semantic vector search — identical quality to the original
+    notebook — but with zero startup cost because the index was built offline
+    by build_index.py and loaded from disk at startup.
+
+    Falls back to rapidfuzz text-matching if the FAISS index or model is
+    unavailable (e.g. missing precomputed files).
+    """
+    if df.empty:
+        return []
+
+    # ── Semantic path (preferred) ────────────────────────────────────────────
+    if index is not None and embed_model is not None:
+        try:
+            # Encode only the short query string — NOT the dataset
+            q = embed_model.encode([query_text]).astype("float32")
+            faiss.normalize_L2(q)
+            _scores, ids = index.search(q, min(top_k, index.ntotal))
+            return [int(i) for i in ids[0] if i >= 0]
+        except Exception as exc:
+            print(f"⚠️ FAISS search failed ({exc}), falling back to rapidfuzz")
+
+    # ── Fallback: rapidfuzz text matching ────────────────────────────────────
     try:
-        q = embed_model.encode([query_text]).astype("float32")
-        faiss.normalize_L2(q)
-        scores, ids = index.search(q, min(top_k, len(df)))
-        return [int(i) for i in ids[0] if i >= 0]
+        hits = process.extract(query_text, df[INGREDIENT_COL].tolist(), limit=top_k)
+        return [hit[2] for hit in hits if hit[1] > 0]
     except Exception:
         return list(range(min(len(df), top_k)))
 
