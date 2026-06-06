@@ -8,6 +8,18 @@ import faiss
 import pandas as pd
 from rapidfuzz import process
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Railway may use "HF TOKEN" with a space; huggingface_hub expects HF_TOKEN.
+if not os.getenv("HF_TOKEN") and not os.getenv("HUGGING_FACE_HUB_TOKEN"):
+    _hf = os.getenv("HF TOKEN", "").strip()
+    if _hf:
+        os.environ["HF_TOKEN"] = _hf
+
 CSV_PATH = os.getenv("EGYPT_DRUGS_CSV", "egypt_drugs_cleaned_utf8.csv")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "faiss.index")
 EMBED_MODEL_NAME = os.getenv(

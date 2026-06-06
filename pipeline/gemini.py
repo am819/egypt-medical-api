@@ -7,18 +7,51 @@ from typing import Any, Optional
 
 import requests
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from pipeline.assessment import parse_clinical_pipeline
 from pipeline.context import PatientContext, build_patient_summary
 from pipeline.models import ClinicalPipelineResult, clinical_pipeline_json_schema
 from pipeline.prompts import CLINICAL_PIPELINE_PROMPT, INTAKE_PROMPT, TEMPORARY_TREATMENT_NOTE
 
+# Accept Railway-style names (spaces) and standard underscore names.
+_GEMINI_KEY_ENV_ALIASES: tuple[tuple[str, ...], ...] = (
+    ("GEMINI_API_KEY", "GEMINI API KEY", "GOOGLE_API_KEY"),
+    ("GEMINI_API_KEY_2", "GEMINI API KEY 2", "GEMINI_API_KEY2"),
+    ("GEMINI_API_KEY_3", "GEMINI API KEY 3", "GEMINI_API_KEY3"),
+)
+
+
+def _first_env_value(names: tuple[str, ...]) -> str:
+    for name in names:
+        val = os.getenv(name, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _looks_like_gemini_api_key(key: str) -> bool:
+    """Google AI Studio keys start with AIza; OAuth/Vertex tokens (AQ.) won't work here."""
+    return key.startswith("AIza")
+
 
 def _load_gemini_api_keys() -> list:
-    keys = []
-    for env_name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"):
-        val = os.getenv(env_name, "").strip()
-        if val:
-            keys.append(val)
+    keys: list[str] = []
+    for aliases in _GEMINI_KEY_ENV_ALIASES:
+        val = _first_env_value(aliases)
+        if not val:
+            continue
+        if not _looks_like_gemini_api_key(val):
+            print(
+                f"Skipping {aliases[0]}: expected Google AI Studio key (AIza...), "
+                f"got {val[:8]}..."
+            )
+            continue
+        keys.append(val)
     return keys
 
 
@@ -57,8 +90,8 @@ def call_gemini(
         time.sleep(MIN_INTERVAL - elapsed)
 
     if not GEMINI_API_KEYS:
-        print("❌ No Gemini API keys configured")
-        return None, "gemini_error"
+        print("No Gemini API keys configured (set GEMINI_API_KEY or GEMINI API KEY)")
+        return None, "no_api_key"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     gen_config: dict[str, Any] = {
@@ -154,10 +187,10 @@ def call_structured_clinical(
         CLINICAL_PIPELINE_PROMPT,
         json_schema=clinical_pipeline_json_schema(),
     )
-    if status == "rate_limit":
-        return None, "rate_limit"
+    if status in ("rate_limit", "no_api_key"):
+        return None, status
     if not raw:
-        return None, "gemini_error"
+        return None, status or "gemini_error"
 
     result = parse_clinical_pipeline(raw, ctx)
     if not result:

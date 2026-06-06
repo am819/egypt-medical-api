@@ -40,6 +40,16 @@ def _asks_for_temporary(query: str) -> bool:
     return any(kw in query.lower() for kw in URGENT_TEMP_KEYWORDS)
 
 
+def _gemini_failure_message(status: str) -> str:
+    if status == "rate_limit":
+        return "معلش، النظام مشغول دلوقتي — استنى شوية."
+    if status == "no_api_key":
+        return "عذراً، مفتاح Gemini غير مُعد — راجع GEMINI_API_KEY على Railway."
+    if status == "parse_error":
+        return "عذراً، حدث خطأ في معالجة الرد — حاول تاني."
+    return "عذراً، حدث خطأ في الاتصال."
+
+
 def _full_conversation_text(query: str, history: list) -> str:
     return (conversation_to_text(history) + "\n" + query).strip()
 
@@ -107,10 +117,8 @@ def rag(query: str, history: list) -> str:
         clinical, status = call_structured_clinical(
             query, history, ctx, temporary_override=True,
         )
-        if status == "rate_limit":
-            return "معلش، النظام مشغول دلوقتي — استنى شوية."
         if not clinical:
-            return "عذراً، حدث خطأ في الاتصال."
+            return _gemini_failure_message(status)
         clinical = enrich_clinical_result(clinical, full_text)
         if clinical.status == "needs_info" or not clinical.therapeutic_targets:
             return "عذراً، لم أستطع اقتراح علاج مؤقت مناسب. يرجى التوجه للطوارئ فوراً."
@@ -120,10 +128,8 @@ def rag(query: str, history: list) -> str:
         return format_temporary_response(clinical, matches, safety_notes, full_text)
 
     clinical, status = call_structured_clinical(query, history, ctx)
-    if status == "rate_limit":
-        return "معلش، النظام مشغول دلوقتي — استنى شوية."
     if not clinical:
-        return "عذراً، حدث خطأ في الاتصال."
+        return _gemini_failure_message(status)
 
     clinical = enrich_clinical_result(clinical, full_text)
 
