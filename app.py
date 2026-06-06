@@ -474,6 +474,7 @@ def call_gemini(messages: list):
             r    = requests.post(url, headers=headers, json=payload, timeout=45)
             resp = r.json()
             if "error" in resp:
+                print(f"❌ Gemini API error: {resp['error']}")
                 if resp["error"].get("code") == 429:
                     time.sleep(10)
                     continue
@@ -483,7 +484,8 @@ def call_gemini(messages: list):
             text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
             text = re.sub(r'\(Response.*?\):\s*', '', text)
             return text, GEMINI_MODEL
-        except Exception:
+        except Exception as e:
+            print(f"❌ Gemini call exception (attempt {attempt+1}): {e}")
             time.sleep(5)
     return None, "rate_limit"
 
