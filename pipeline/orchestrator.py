@@ -1,171 +1,95 @@
-"""Main RAG orchestrator — wires all pipeline phases."""
+"""Chat orchestrator — LLM conversation + drug lookup from CLINICAL_PLAN."""
 
-from pipeline.assessment import enrich_clinical_result
-from pipeline.clinical_gates import can_recommend_medications
-from pipeline.context import (
-    conversation_to_text,
-    extract_context,
-    has_real_emergency,
-    intake_gate,
-)
-from pipeline.formatter import (
-    format_assessment_only_response,
-    format_final_response,
-    format_temporary_response,
-    format_urgent_response,
-)
-from pipeline.forms import apply_form_filters
-from pipeline.gemini import call_structured_clinical
-from pipeline.grounding import verify_ingredient_matches
-from pipeline.retrieval import retrieve_for_targets
-from pipeline.safety import apply_safety_filters
-from pipeline.safety_intake import (
-    assess_safety_intake,
-    format_safety_intake_response,
-    last_assistant_message,
-    pregnancy_check_missing,
-    safety_intake_complete,
-)
-from pipeline.session_state import apply_conversation_state, derive_conversation_state
-from pipeline.targets import validate_targets
+import re
+
+from pipeline.gemini import CLINICAL_PLAN_MARKER, chat
+from pipeline.retrieval import DrugMatch, lookup_drugs_by_ingredients
+
+_BUSY_MSG = "معلش، الخدمة مشغولة دلوقتي. حاول تاني بعد شوية."
 
 
-URGENT_TEMP_KEYWORDS = [
-    "مؤقت", "علاج مؤقت", "دواء مؤقت", "اقترح",
-    "مش قادر اروح", "حاجة تخفف", "بس عايز حاجة",
-]
-
-
-def _asks_for_temporary(query: str) -> bool:
-    return any(kw in query.lower() for kw in URGENT_TEMP_KEYWORDS)
-
-
-def _gemini_failure_message(status: str) -> str:
+def _failure_message(status: str) -> str:
     if status == "rate_limit":
-        return "معلش، الخدمة مشغولة دلوقتي. حاول تاني بعد شوية."
+        return _BUSY_MSG
     if status == "no_api_key":
         return "عذراً، مفتاح Gemini غير مُعد — راجع GEMINI_API_KEY على Railway."
-    if status == "parse_error":
-        return "عذراً، حدث خطأ في معالجة الرد — حاول تاني."
     return "عذراً، حدث خطأ في الاتصال."
 
 
-def _full_conversation_text(query: str, history: list) -> str:
-    return (conversation_to_text(history) + "\n" + query).strip()
+def _parse_field(block: str, field: str) -> str:
+    match = re.search(rf"^{field}:\s*(.+)$", block, re.MULTILINE | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
 
 
-def _pregnancy_block(ctx, query: str) -> str | None:
-    """Pre-medication check for females 18+."""
-    missing = pregnancy_check_missing(ctx, query)
-    if missing:
-        return f"قبل ما أقترح أدوية، محتاج أعرف: {missing}"
-    return None
+def _split_list(value: str) -> list[str]:
+    if not value or value.lower() in ("none", "n/a", "-"):
+        return []
+    parts = re.split(r"[,|]", value)
+    return [p.strip() for p in parts if p.strip() and p.strip().lower() not in ("none", "n/a")]
 
 
-def _finalize_matches(clinical, targets):
-    matches = retrieve_for_targets(targets, clinical.assessment)
-    matches, safety_notes = apply_safety_filters(matches, clinical.assessment)
-    matches = apply_form_filters(matches, clinical.assessment)
-    matches = verify_ingredient_matches(matches)
-    return matches, safety_notes
+def parse_clinical_plan(text: str) -> dict | None:
+    """Extract CLINICAL_PLAN fields from LLM response."""
+    if CLINICAL_PLAN_MARKER not in text:
+        return None
+    idx = text.index(CLINICAL_PLAN_MARKER)
+    block = text[idx:]
+    return {
+        "ingredients": _split_list(_parse_field(block, "INGREDIENTS")),
+        "excluded": _split_list(_parse_field(block, "EXCLUDED_INGREDIENTS")),
+        "escalation": _parse_field(block, "ESCALATION_LEVEL"),
+        "confidence": _parse_field(block, "DIAGNOSIS_CONFIDENCE"),
+        "non_drug_advice": _split_list(_parse_field(block, "NON_DRUG_ADVICE")),
+    }
 
 
-def _block_medications_without_safety(ctx, full_text, history, query, session) -> str | None:
-    if not safety_intake_complete(ctx, full_text, history, query, session=session):
-        status = assess_safety_intake(ctx, full_text, history, query, session=session)
-        return format_safety_intake_response(status)
-    return None
+def strip_clinical_plan(text: str) -> str:
+    """Remove the CLINICAL_PLAN block from user-visible text."""
+    if CLINICAL_PLAN_MARKER not in text:
+        return text.strip()
+    return text[: text.index(CLINICAL_PLAN_MARKER)].strip()
 
 
-def _handle_needs_info(clinical, full_text, history, query, ctx, session) -> str:
-    """One-shot response for critical safety gaps — no conversational fallback."""
-    if clinical.patient_message_ar:
-        return clinical.patient_message_ar
-    missing = list(clinical.missing_fields or [])
-    if not missing:
-        status = assess_safety_intake(ctx, full_text, history, query, session=session)
-        missing = status.missing_prompts()
-    if missing:
-        return "عشان أكمل التقييم بأمان، محتاج أعرف: " + "، ".join(missing[:3]) + "."
-    return format_assessment_only_response(clinical, full_text)
+def format_drug_section(matches: list[DrugMatch]) -> str:
+    if not matches:
+        return "─── الأدوية من القاعدة ───\n⚠️ مفيش أدوية مطابقة في القاعدة للمواد الفعالة المقترحة."
+    lines = ["─── الأدوية من القاعدة ───"]
+    for m in matches:
+        display = m.name_ar or m.name_en or "—"
+        en = f" ({m.name_en})" if m.name_en and m.name_en != m.name_ar else ""
+        lines.append(f"💊 {display}{en} [#{m.row_id}]")
+        if m.active_ingredient:
+            lines.append(f"   • {m.active_ingredient}")
+    return "\n".join(lines)
 
 
 def _rag_inner(query: str, history: list) -> str:
-    """Core RAG inference — single-pass structured clinical pipeline."""
-    full_text = _full_conversation_text(query, history)
-    last_bot = last_assistant_message(history)
-    temporary_override = "روح الطوارئ فوراً" in last_bot and _asks_for_temporary(query)
+    raw, status = chat(query, history)
+    if not raw:
+        return _failure_message(status)
 
-    ctx = extract_context(query, history)
-    session = derive_conversation_state(history, query, ctx)
-    ctx = apply_conversation_state(ctx, session)
+    plan = parse_clinical_plan(raw)
+    visible = strip_clinical_plan(raw)
 
-    gate = intake_gate(ctx, history, query)
-    if gate:
-        return gate
+    if not plan or not plan["ingredients"]:
+        return visible or raw
 
-    if temporary_override:
-        preg = _pregnancy_block(ctx, query)
-        if preg:
-            return preg
-        med_block = _block_medications_without_safety(
-            ctx, full_text, history, query, session,
-        )
-        if med_block:
-            return med_block
-
-        clinical, status = call_structured_clinical(
-            query, history, ctx, temporary_override=True,
-        )
-        if not clinical:
-            return _gemini_failure_message(status)
-        clinical = enrich_clinical_result(clinical, full_text)
-        if clinical.status == "needs_info" or not clinical.therapeutic_targets:
-            return "عذراً، لم أستطع اقتراح علاج مؤقت مناسب. يرجى التوجه للطوارئ فوراً."
-
-        targets = validate_targets(clinical.therapeutic_targets, clinical.assessment)
-        matches, safety_notes = _finalize_matches(clinical, targets)
-        return format_temporary_response(clinical, matches, safety_notes, full_text)
-
-    clinical, status = call_structured_clinical(query, history, ctx)
-    if not clinical:
-        return _gemini_failure_message(status)
-
-    clinical = enrich_clinical_result(clinical, full_text)
-
-    if clinical.status == "needs_info":
-        return _handle_needs_info(clinical, full_text, history, query, ctx, session)
-
-    if (
-        clinical.status == "urgent"
-        or clinical.differential.requires_urgent_care
-        or has_real_emergency(ctx)
-    ):
-        return format_urgent_response(clinical, full_text)
-
-    targets = validate_targets(clinical.therapeutic_targets, clinical.assessment)
-    can_meds = bool(targets) and can_recommend_medications(full_text, clinical.assessment)
-
-    if not can_meds:
-        if clinical.differential.possible_conditions:
-            return format_final_response(clinical, [], [], full_text)
-        return format_assessment_only_response(clinical, full_text)
-
-    preg = _pregnancy_block(ctx, query)
-    if preg:
-        return preg
-    med_block = _block_medications_without_safety(
-        ctx, full_text, history, query, session,
+    drugs = lookup_drugs_by_ingredients(
+        plan["ingredients"],
+        excluded=plan.get("excluded"),
+        max_per_ingredient=2,
     )
-    if med_block:
-        return med_block
+    drug_section = format_drug_section(drugs)
 
-    matches, safety_notes = _finalize_matches(clinical, targets)
-    return format_final_response(clinical, matches, safety_notes, full_text)
+    parts = [visible] if visible else []
+    if plan.get("non_drug_advice"):
+        parts.append("📋 نصائح:\n" + "\n".join(f"   • {a}" for a in plan["non_drug_advice"]))
+    parts.append(drug_section)
+    return "\n\n".join(parts)
 
 
 def rag(query: str, history: list) -> str:
     result = _rag_inner(query, history)
     if not result or not result.strip():
-        return "معلش، الخدمة مشغولة دلوقتي. حاول تاني بعد شوية."
+        return _BUSY_MSG
     return result

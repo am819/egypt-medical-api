@@ -1,10 +1,10 @@
-"""Gemini API client with JSON structured output support."""
+"""Gemini API client with key rotation."""
 
 import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 import requests
 
@@ -14,10 +14,7 @@ try:
 except ImportError:
     pass
 
-from pipeline.assessment import parse_clinical_pipeline
-from pipeline.context import PatientContext, build_patient_summary
-from pipeline.models import ClinicalPipelineResult, clinical_pipeline_json_schema
-from pipeline.prompts import CLINICAL_PIPELINE_PROMPT, INTAKE_PROMPT, TEMPORARY_TREATMENT_NOTE
+from pipeline.prompts import SYSTEM_PROMPT
 
 GEMINI_API_KEYS = [
     k for k in [
@@ -27,11 +24,12 @@ GEMINI_API_KEYS = [
     ] if k
 ]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash")
-GEMINI_TIMEOUT_SEC = int(os.getenv("GEMINI_TIMEOUT_SEC", "25"))
+GEMINI_TIMEOUT_SEC = int(os.getenv("GEMINI_TIMEOUT_SEC", "40"))
 MIN_INTERVAL = 6.0  # 10 RPM per key (60s / 10)
 GEMINI_KEY_EXHAUSTED_UNTIL: list[float] = [0.0] * len(GEMINI_API_KEYS)
 _last_call_times: list[float] = [0.0] * len(GEMINI_API_KEYS)
+
+CLINICAL_PLAN_MARKER = "───CLINICAL_PLAN───"
 
 
 def _trim_history_for_gemini(history: list, max_messages: int = 10) -> list:
@@ -117,44 +115,26 @@ def _is_rate_limit(response: requests.Response, error: dict) -> bool:
     return "RESOURCE_EXHAUSTED" in status or "QUOTA" in status
 
 
-def _is_model_error(response: requests.Response, error: dict) -> bool:
-    if response.status_code == 404:
-        return True
-    status = str(error.get("status", "")).upper()
-    if status in ("NOT_FOUND", "FAILED_PRECONDITION"):
-        return True
-    msg = str(error.get("message", "")).lower()
-    return "model" in msg and ("not found" in msg or "not supported" in msg)
-
-
-def _models_to_try() -> list[str]:
-    models = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL not in models:
-        models.append(GEMINI_FALLBACK_MODEL)
-    return models
-
-
-def _call_gemini_model(
-    model: str,
+def call_gemini(
     messages: list,
     system_prompt: str,
     *,
-    json_schema: Optional[dict[str, Any]] = None,
-    max_tokens: int = 3072,
+    max_tokens: int = 2048,
 ) -> tuple[Optional[str], str]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gen_config: dict[str, Any] = {
-        "temperature": 0.1,
-        "maxOutputTokens": max_tokens,
-    }
-    if json_schema:
-        gen_config["responseMimeType"] = "application/json"
-        gen_config["responseSchema"] = json_schema
+    # Picks first key off cooldown (or waits for soonest); on 503/429 marks key exhausted and rotates.
+    # Each key enforces its own 6s RPM interval; success returns immediately.
+    if not GEMINI_API_KEYS:
+        print("No Gemini API keys configured (set GEMINI_API_KEY or GEMINI API KEY)")
+        return None, "no_api_key"
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": messages,
-        "generationConfig": gen_config,
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": max_tokens,
+        },
     }
     n_keys = len(GEMINI_API_KEYS)
     key_idx = _pick_key_index()
@@ -169,24 +149,19 @@ def _call_gemini_model(
             resp = r.json()
             if "error" in resp:
                 err = resp["error"]
-                print(f"❌ Gemini API error ({model}, key {key_idx + 1}/{n_keys}): {err}")
-                if _is_model_error(r, err):
-                    return None, "model_error"
+                print(f"Gemini API error (key {key_idx + 1}/{n_keys}): {err}")
                 if _is_unavailable(r, err):
                     GEMINI_KEY_EXHAUSTED_UNTIL[key_idx] = time.time() + 60
-                    print(f"🔑 Key {key_idx + 1} unavailable — cooldown 60s, rotating")
                     key_idx = _pick_key_index()
                     continue
                 if _is_rate_limit(r, err):
                     retry_after = _parse_retry_after(r)
                     GEMINI_KEY_EXHAUSTED_UNTIL[key_idx] = time.time() + retry_after
-                    print(f"🔑 Key {key_idx + 1} rate-limited — cooldown {retry_after}s, rotating")
                     key_idx = _pick_key_index()
                     continue
                 return None, "gemini_error"
             candidates = resp.get("candidates") or []
             if not candidates:
-                print(f"❌ Gemini empty response ({model}, key {key_idx + 1}): {resp}")
                 other = _another_available_key(key_idx)
                 if other is not None:
                     key_idx = other
@@ -194,7 +169,6 @@ def _call_gemini_model(
                 return None, "rate_limit"
             parts = candidates[0].get("content", {}).get("parts") or []
             if not parts or "text" not in parts[0]:
-                print(f"❌ Gemini missing text ({model}, key {key_idx + 1}): {resp}")
                 other = _another_available_key(key_idx)
                 if other is not None:
                     key_idx = other
@@ -203,52 +177,19 @@ def _call_gemini_model(
             text = parts[0]["text"].strip()
             text = re.sub(r"\(Internal Reasoning\).*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
             text = re.sub(r"\(Response.*?\):\s*", "", text)
-            return text, model
+            return text, GEMINI_MODEL
         except requests.Timeout:
-            print(f"❌ Gemini timeout ({model}, key {key_idx + 1}/{n_keys})")
             other = _another_available_key(key_idx)
             if other is not None:
                 key_idx = other
                 continue
             return None, "rate_limit"
         except Exception as e:
-            print(f"❌ Gemini call exception ({model}, key {key_idx + 1}): {e}")
+            print(f"Gemini call exception (key {key_idx + 1}): {e}")
             return None, "gemini_error"
 
 
-def call_gemini(
-    messages: list,
-    system_prompt: str,
-    *,
-    json_schema: Optional[dict[str, Any]] = None,
-    max_tokens: int = 3072,
-) -> tuple[Optional[str], str]:
-    # Picks first key off cooldown (or waits for soonest); on 503/429 marks key exhausted and rotates.
-    # Each key enforces its own 6s RPM interval; on failure retries with GEMINI_FALLBACK_MODEL.
-    if not GEMINI_API_KEYS:
-        print("No Gemini API keys configured (set GEMINI_API_KEY or GEMINI API KEY)")
-        return None, "no_api_key"
-
-    models = _models_to_try()
-    for model_idx, model in enumerate(models):
-        text, status = _call_gemini_model(
-            model,
-            messages,
-            system_prompt,
-            json_schema=json_schema,
-            max_tokens=max_tokens,
-        )
-        if text:
-            if model_idx > 0:
-                print(f"✅ Gemini fallback succeeded with {model}")
-            return text, status
-        if model_idx < len(models) - 1:
-            print(f"🔁 Gemini {model} failed ({status}) — trying fallback {models[model_idx + 1]}")
-
-    return None, "rate_limit"
-
-
-def _build_gemini_messages(history: list, augmented: str) -> list:
+def _build_messages(history: list, query: str) -> list:
     gemini_messages = [
         {
             "role": "user" if m["role"] == "user" else "model",
@@ -256,41 +197,11 @@ def _build_gemini_messages(history: list, augmented: str) -> list:
         }
         for m in _trim_history_for_gemini(history)
     ]
-    gemini_messages.append({"role": "user", "parts": [{"text": augmented}]})
+    gemini_messages.append({"role": "user", "parts": [{"text": query.strip()}]})
     return gemini_messages
 
 
-def call_structured_clinical(
-    query: str,
-    history: list,
-    ctx: PatientContext,
-    *,
-    temporary_override: bool = False,
-) -> tuple[Optional[ClinicalPipelineResult], str]:
-    """Call Gemini with JSON schema for Phases 1-3."""
-    augmented = build_patient_summary(ctx) + "\nسؤال المريض الحالي:\n" + query.strip()
-    if temporary_override:
-        augmented += "\n\n" + TEMPORARY_TREATMENT_NOTE
-
-    messages = _build_gemini_messages(history, augmented)
-    raw, status = call_gemini(
-        messages,
-        CLINICAL_PIPELINE_PROMPT,
-        json_schema=clinical_pipeline_json_schema(),
-    )
-    if status in ("rate_limit", "no_api_key"):
-        return None, status
-    if not raw:
-        return None, status or "gemini_error"
-
-    result = parse_clinical_pipeline(raw, ctx)
-    if not result:
-        return None, "parse_error"
-    return result, "ok"
-
-
-def call_intake_conversational(query: str, history: list, ctx: PatientContext) -> tuple[Optional[str], str]:
-    """Conversational intake when structured pipeline returns needs_info."""
-    augmented = build_patient_summary(ctx) + "\nسؤال المريض الحالي:\n" + query.strip()
-    messages = _build_gemini_messages(history, augmented)
-    return call_gemini(messages, INTAKE_PROMPT, max_tokens=1024)
+def chat(query: str, history: list) -> tuple[Optional[str], str]:
+    """Single conversational Gemini call with SYSTEM_PROMPT."""
+    messages = _build_messages(history, query)
+    return call_gemini(messages, SYSTEM_PROMPT, max_tokens=2048)

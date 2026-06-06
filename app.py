@@ -1,15 +1,14 @@
 """
-app.py — Production FastAPI backend for the Egyptian Medical AI Chatbot (RAG)
-==============================================================================
-7-phase clinical pipeline: assessment → differential → therapeutic targets →
-dataset retrieval → safety → form validation → structured response.
+app.py — Production FastAPI backend for the Egyptian Medical AI Chatbot
+========================================================================
+Conversational Gemini doctor + Egyptian drug database lookup by active ingredient.
 
 Run with:
     uvicorn app:app --host 0.0.0.0 --port $PORT
 
 Required files next to app.py:
     egypt_drugs_cleaned_utf8.csv
-    faiss.index          (generate with build_index.py)
+    faiss.index          (optional — generate with build_index.py)
 """
 
 import asyncio
@@ -26,7 +25,7 @@ from pipeline import dataset
 from pipeline.gemini import GEMINI_API_KEYS, get_keys_status
 from pipeline.orchestrator import rag
 
-CHAT_TIMEOUT_SEC = int(os.getenv("CHAT_TIMEOUT_SEC", "50"))
+CHAT_TIMEOUT_SEC = int(os.getenv("CHAT_TIMEOUT_SEC", "60"))
 _rag_lock = Lock()
 
 # ── Load drug dataset at startup ─────────────────────────────────────────────
@@ -42,7 +41,7 @@ except Exception as e:
 # ══════════════════════════════════════════════════════════════════════════════
 app = FastAPI(
     title="Egyptian Medical AI API",
-    description="7-phase clinical RAG chatbot backed by Gemini and a local drug database.",
+    description="محادثة طبية ذكية + قاعدة أدوية مصرية — Gemini 2.5 Flash",
     version="2.0.0",
 )
 

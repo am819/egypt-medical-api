@@ -1,1 +1,1 @@
-"""7-phase clinical RAG pipeline for Egyptian drug recommendations."""
+"""Egyptian medical chatbot pipeline — Gemini chat + drug lookup."""
