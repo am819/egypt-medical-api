@@ -193,21 +193,19 @@ def enrich_clinical_result(
     status = result.status
     targets = list(result.therapeutic_targets)
 
-    if completeness < MIN_COMPLETENESS_FOR_DX:
-        status = "needs_info"
-        differential = DifferentialDiagnosis(
-            possible_conditions=[],
-            confidence_levels=[],
-            red_flag_assessment=differential.red_flag_assessment,
-            requires_urgent_care=differential.requires_urgent_care,
-        )
-        targets = []
-
     if completeness < MIN_COMPLETENESS_FOR_MEDS:
         targets = []
 
-    if status == "ready" and completeness < MIN_COMPLETENESS_FOR_DX:
+    critical_safety_gaps = (
+        assessment.age is None
+        or assessment.sex == "unknown"
+    )
+    if status == "ready" and targets and critical_safety_gaps:
         status = "needs_info"
+
+    if status == "needs_info" and not critical_safety_gaps and not result.missing_fields:
+        if assessment.main_symptoms:
+            status = "ready"
 
     return result.model_copy(update={
         "assessment": assessment,

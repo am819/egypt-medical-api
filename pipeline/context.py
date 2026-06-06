@@ -197,18 +197,16 @@ def parse_pregnancy_breastfeeding(text: str):
 
 
 def extract_list_after_keywords(text: str, keywords: list, check_negation: bool = True) -> list:
-    if check_negation and has_negation_response(text):
-        return []
     found = []
     for kw in keywords:
         m = re.search(rf"{kw}\s*[:：]?\s*([^\n\.،]+)", text, re.IGNORECASE)
         if m:
             raw = m.group(1)
-            if has_negation_response(raw):
-                return []
+            if check_negation and has_negation_response(raw):
+                continue
             for item in re.split(r"[,،/|+]", raw):
                 item = item.strip()
-                if item and not has_negation_response(item):
+                if item and (not check_negation or not has_negation_response(item)):
                     found.append(item)
     return dedupe_keep_order(found)
 

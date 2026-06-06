@@ -207,13 +207,11 @@ def format_safety_intake_response(status: SafetyIntakeStatus) -> str:
     if not missing:
         return ""
     lines = [
-        "قبل ما أقيّم حالتك أو أقترح أي دواء، محتاج أتأكد من:",
+        "قبل ما أقترح أي دواء، محتاج أتأكد من:",
         "",
-        f"• {missing[0]}",
     ]
-    if len(missing) > 1:
-        lines.append("")
-        lines.append(f"(باقي {len(missing) - 1} سؤال أمان — هنسأل عنهم بعد ما تجاوب.)")
+    for item in missing:
+        lines.append(f"• {item}")
     lines.append("")
     lines.append("لو مفيش أمراض مزمنة / حساسية / أدوية حالية، قولّي بوضوح «مفيش».")
     return "\n".join(lines)
