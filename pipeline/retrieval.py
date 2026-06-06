@@ -11,6 +11,7 @@ from pipeline.safety import (
     is_baby_drug,
     screen_ingredient_safety,
 )
+from pipeline.grounding import verify_drug_row
 from pipeline.targets import ingredient_candidates_for_target, search_keywords_for_target
 
 
@@ -79,13 +80,16 @@ def get_matching_drugs_for_ingredient(
 
     results: list[DrugRow] = []
     for _, row_dict in items[:max_results]:
-        results.append(DrugRow(
+        candidate = DrugRow(
             row_id=row_dict["row_id"],
             name_ar=row_dict.get("name_ar", ""),
             name_en=row_dict.get("name_en", ""),
             active_ingredient=row_dict.get(dataset.INGREDIENT_COL, ""),
             safety_cautions=row_dict.get("safety_cautions", []),
-        ))
+        )
+        verified = verify_drug_row(candidate)
+        if verified:
+            results.append(verified)
     return results
 
 

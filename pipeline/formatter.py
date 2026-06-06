@@ -1,6 +1,7 @@
 """Phase 7 — structured Arabic medical response formatter."""
 
 from pipeline.models import ClinicalPipelineResult, IngredientMatch, SafetyNote
+from pipeline.red_flags import build_red_flag_section
 
 CONFIDENCE_AR = {"high": "عالية", "medium": "متوسطة", "low": "منخفضة"}
 
@@ -30,7 +31,10 @@ def _format_differential(clinical: ClinicalPipelineResult) -> str:
     lines = []
     for i, cond in enumerate(d.possible_conditions):
         conf = d.confidence_levels[i] if i < len(d.confidence_levels) else "medium"
-        lines.append(f"{i + 1}. الأعراض دي ممكن تكون متوافقة مع **{cond}** (ثقة: {CONFIDENCE_AR.get(conf, conf)})")
+        lines.append(
+            f"{i + 1}. الأعراض دي **ممكن تكون متوافقة مع** {cond} "
+            f"(ثقة: {CONFIDENCE_AR.get(conf, conf)})"
+        )
     return "\n".join(lines)
 
 
@@ -51,7 +55,12 @@ def _format_drugs(matches: list[IngredientMatch]) -> str:
     for m in matches:
         blocks.append(f"🔹 **المادة الفعالة: {m.ingredient.title()}** (هدف: {m.target})")
         for d in m.drugs:
-            blocks.append(f"   💊 **{d.name_ar or '—'}** | {d.name_en or '—'}")
+            display_name = d.name_ar or d.name_en or "—"
+            en_name = f" | {d.name_en}" if d.name_en and d.name_en != d.name_ar else ""
+            blocks.append(f"   💊 **{display_name}**{en_name}")
+            if d.active_ingredient:
+                blocks.append(f"      • Active Ingredient: {d.active_ingredient}")
+            blocks.append(f"      • Row ID: {d.row_id}")
         blocks.append("")
     return "\n".join(blocks).strip()
 
@@ -68,8 +77,9 @@ def _format_safety_notes(
     for m in matches:
         for d in m.drugs:
             for c in d.safety_cautions:
-                if c not in lines:
-                    lines.append(f"⚠️ {d.name_ar}: {c}")
+                line = f"⚠️ {d.name_ar}: {c}"
+                if line not in lines:
+                    lines.append(line)
     if clinical.non_drug_advice:
         lines.append("📋 نصائح غير دوائية:")
         for adv in clinical.non_drug_advice:
@@ -77,23 +87,13 @@ def _format_safety_notes(
     return "\n".join(lines) if lines else "لا توجد ملاحظات أمان إضافية."
 
 
-def _format_red_flags(clinical: ClinicalPipelineResult) -> str:
-    flags = list(clinical.assessment.red_flags)
-    if clinical.differential.red_flag_assessment:
-        flags.append(clinical.differential.red_flag_assessment)
-    all_low = (
-        clinical.differential.confidence_levels
-        and all(c == "low" for c in clinical.differential.confidence_levels)
-    )
-    if all_low:
-        flags.append("الثقة التشخيصية منخفضة — لو الأعراض زادت، اكشف فوراً.")
-    if not flags:
-        return "لا توجد علامات خطر إضافية حالياً — راقب الأعراض."
-    return "\n".join(f"🚨 {f}" for f in flags)
-
-
-def format_urgent_response(clinical: ClinicalPipelineResult) -> str:
+def format_urgent_response(clinical: ClinicalPipelineResult, full_text: str = "") -> str:
     intro = clinical.patient_message_ar or "فيه علامات خطر محتملة."
+    red_section = build_red_flag_section(
+        clinical.assessment,
+        full_text,
+        clinical.differential.red_flag_assessment,
+    )
     parts = [
         intro,
         "",
@@ -103,7 +103,7 @@ def format_urgent_response(clinical: ClinicalPipelineResult) -> str:
         _format_assessment_summary(clinical),
         "",
         "## تقييم علامات الخطر",
-        clinical.differential.red_flag_assessment or _format_red_flags(clinical),
+        red_section,
     ]
     return "\n".join(parts)
 
@@ -112,8 +112,9 @@ def format_temporary_response(
     clinical: ClinicalPipelineResult,
     matches: list[IngredientMatch],
     safety_notes: list[SafetyNote],
+    full_text: str = "",
 ) -> str:
-    body = format_final_response(clinical, matches, safety_notes)
+    body = format_final_response(clinical, matches, safety_notes, full_text)
     warning = (
         "🚨 **تنبيه خطير:** حالتك تستدعي الطوارئ فوراً. "
         "الأدوية التالية هي حل مؤقت فقط حتى تتمكن من الوصول للمستشفى.\n\n"
@@ -125,6 +126,7 @@ def format_final_response(
     clinical: ClinicalPipelineResult,
     matches: list[IngredientMatch],
     safety_notes: list[SafetyNote] | None = None,
+    full_text: str = "",
 ) -> str:
     safety_notes = safety_notes or []
     intro = clinical.patient_message_ar.strip()
@@ -151,7 +153,11 @@ def format_final_response(
         _format_safety_notes(matches, safety_notes, clinical),
         "",
         "## 6. علامات تحتاج مراجعة طبية",
-        _format_red_flags(clinical),
+        build_red_flag_section(
+            clinical.assessment,
+            full_text,
+            clinical.differential.red_flag_assessment,
+        ),
     ])
 
     all_low = (

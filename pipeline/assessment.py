@@ -1,15 +1,29 @@
 """Phase 1-3 assessment merge and validation."""
 
 import json
+import re
 from typing import Optional
 
 from pipeline.context import PatientContext, dedupe_keep_order, patient_context_to_assessment
+from pipeline.followup import compute_info_completeness
 from pipeline.models import (
     ClinicalAssessment,
     ClinicalPipelineResult,
     DifferentialDiagnosis,
     TherapeuticTarget,
 )
+from pipeline.red_flags import detect_additional_red_flags
+
+# Prefer broad categories when clinical detail is limited
+_SPECIFIC_TO_BROAD: list[tuple[str, str]] = [
+    (r"pharyngitis|tonsillitis|strep", "Upper Respiratory Tract Infection"),
+    (r"bronchitis|pneumonia", "Lower Respiratory Tract Infection"),
+    (r"gastroenteritis|food poisoning", "Acute Gastrointestinal Illness"),
+    (r"uti|urinary tract|cystitis", "Urinary Tract Condition"),
+    (r"migraine|tension headache", "Headache Syndrome"),
+    (r"dermatitis|eczema|urticaria", "Skin Condition"),
+    (r"sinusitis|rhinitis", "Upper Respiratory Tract Infection"),
+]
 
 
 def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> ClinicalAssessment:
@@ -52,6 +66,76 @@ def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> Clin
     )
 
 
+def _broaden_condition(condition: str, completeness: float) -> str:
+    """Replace overly specific labels with broader categories when info is limited."""
+    if completeness >= 0.75:
+        return condition
+    lowered = condition.lower()
+    for pattern, broad in _SPECIFIC_TO_BROAD:
+        if re.search(pattern, lowered, re.IGNORECASE):
+            return broad
+    if completeness < 0.5 and len(condition.split()) > 4:
+        return " ".join(condition.split()[:3]) + " (احتمالية عامة)"
+    return condition
+
+
+def calibrate_differential(
+    differential: DifferentialDiagnosis,
+    assessment: ClinicalAssessment,
+    full_text: str,
+) -> DifferentialDiagnosis:
+    """Downgrade overconfident diagnoses; prefer broad categories when info is incomplete."""
+    completeness = compute_info_completeness(full_text, assessment)
+    calibrated_confidences: list[str] = []
+    calibrated_conditions: list[str] = []
+
+    for i, cond in enumerate(differential.possible_conditions):
+        raw_conf = (
+            differential.confidence_levels[i]
+            if i < len(differential.confidence_levels)
+            else "medium"
+        )
+
+        conf = raw_conf
+        if completeness < 0.5:
+            conf = "low"
+        elif completeness < 0.75 and conf == "high":
+            conf = "medium"
+        elif conf == "high" and completeness < 0.85:
+            conf = "medium"
+
+        calibrated_confidences.append(conf)
+        calibrated_conditions.append(_broaden_condition(cond, completeness))
+
+    return DifferentialDiagnosis(
+        possible_conditions=calibrated_conditions,
+        confidence_levels=calibrated_confidences,
+        red_flag_assessment=differential.red_flag_assessment,
+        requires_urgent_care=differential.requires_urgent_care,
+    )
+
+
+def enrich_clinical_result(
+    result: ClinicalPipelineResult,
+    full_text: str,
+) -> ClinicalPipelineResult:
+    """Post-process LLM output: merge red flags, calibrate confidence."""
+    extra_flags = detect_additional_red_flags(result.assessment, full_text)
+    merged_flags = dedupe_keep_order(result.assessment.red_flags + extra_flags)
+    assessment = result.assessment.model_copy(update={"red_flags": merged_flags})
+    differential = calibrate_differential(result.differential, assessment, full_text)
+
+    status = result.status
+    if status == "ready" and compute_info_completeness(full_text, assessment) < 0.4:
+        status = "needs_info"
+
+    return result.model_copy(update={
+        "assessment": assessment,
+        "differential": differential,
+        "status": status,
+    })
+
+
 def parse_clinical_pipeline(raw_text: str, regex_ctx: PatientContext) -> Optional[ClinicalPipelineResult]:
     """Parse Gemini JSON response into ClinicalPipelineResult."""
     if not raw_text:
@@ -92,7 +176,7 @@ def parse_clinical_pipeline(raw_text: str, regex_ctx: PatientContext) -> Optiona
         if status not in ("needs_info", "ready", "urgent"):
             status = "needs_info"
 
-        return ClinicalPipelineResult(
+        result = ClinicalPipelineResult(
             status=status,
             patient_message_ar=data.get("patient_message_ar", ""),
             missing_fields=data.get("missing_fields") or [],
@@ -101,6 +185,7 @@ def parse_clinical_pipeline(raw_text: str, regex_ctx: PatientContext) -> Optiona
             therapeutic_targets=targets,
             non_drug_advice=data.get("non_drug_advice") or [],
         )
+        return result
     except Exception as e:
         print(f"❌ Failed to build ClinicalPipelineResult: {e}")
         return None
