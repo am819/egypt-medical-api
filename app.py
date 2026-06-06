@@ -20,7 +20,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pipeline import dataset
 from pipeline.gemini import GEMINI_API_KEYS
@@ -52,7 +52,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    history: list = []
+    history: list = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

@@ -7,3 +7,4 @@ sentence-transformers>=2.7.0
 faiss-cpu>=1.8.0
 rapidfuzz>=3.6.0
 pydantic>=2.7.0
+pytest>=8.2.0

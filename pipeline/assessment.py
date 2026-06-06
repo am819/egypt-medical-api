@@ -53,6 +53,30 @@ def _normalize_chronic_diseases(conditions: list[str]) -> list[str]:
     return dedupe_keep_order(canonical)
 
 
+def _clean_severity_indicators(
+    indicators: list[str],
+    *,
+    age: int | None,
+) -> list[str]:
+    """Drop numeric values that look like demographics, not clinical severity."""
+    cleaned: list[str] = []
+    for raw in indicators:
+        item = str(raw).strip()
+        if not item:
+            continue
+        numbers = re.findall(r"\d+(?:\.\d+)?", item)
+        if age is not None and item == str(age):
+            continue
+        if age is not None and numbers == [str(age)] and not re.search(
+            r"حرار|سخون|temperature|fever|شدة|sever|/10",
+            item,
+            re.IGNORECASE,
+        ):
+            continue
+        cleaned.append(item)
+    return dedupe_keep_order(cleaned)
+
+
 def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> ClinicalAssessment:
     """Merge regex baseline with LLM assessment; regex red flags are never dropped."""
     base = patient_context_to_assessment(regex_ctx)
@@ -76,6 +100,11 @@ def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> Clin
     if cough_type not in ("wet", "dry", "unknown"):
         cough_type = "unknown"
 
+    severity = _clean_severity_indicators(
+        base.severity_indicators + llm.severity_indicators,
+        age=age,
+    )
+
     return ClinicalAssessment(
         age=age,
         sex=sex if sex in ("male", "female", "unknown") else "unknown",
@@ -87,7 +116,7 @@ def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> Clin
         main_symptoms=main_symptoms,
         associated_symptoms=dedupe_keep_order(llm.associated_symptoms),
         symptom_duration=llm.symptom_duration or base.symptom_duration,
-        severity_indicators=dedupe_keep_order(base.severity_indicators + llm.severity_indicators),
+        severity_indicators=severity,
         red_flags=red_flags,
         cough_type=cough_type,
         diarrhea_blood=regex_ctx.diarrhea_blood or llm.diarrhea_blood,

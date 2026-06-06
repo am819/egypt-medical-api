@@ -139,9 +139,9 @@ def extract_age(text: str) -> Optional[int]:
 
 def extract_sex(text: str) -> str:
     norm = normalize_text(text)
-    if any(w in norm for w in ["ذكر", "راجل", "male"]):
+    if any(w in norm for w in ["ذكر", "راجل", "male", "ابني", "الولد", "ابن"]):
         return "male"
-    if any(w in norm for w in ["انثى", "انثي", "ست", "بنت", "female", "حامل", "مرضع"]):
+    if any(w in norm for w in ["انثى", "انثي", "ست", "بنت", "female", "حامل", "مرضع", "بنتي", "البنت"]):
         return "female"
     return "unknown"
 
@@ -229,7 +229,7 @@ def extract_conditions(text: str) -> list:
             if _has_hypertension_context(norm):
                 found.append(canonical)
             continue
-        if any(k in norm for k in kws):
+        if any(normalize_text(k) in norm for k in kws):
             found.append(canonical)
     return dedupe_keep_order(found)
 

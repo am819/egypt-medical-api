@@ -14,10 +14,15 @@ from pipeline.formatter import (
     format_temporary_response,
     format_urgent_response,
 )
+from pipeline.followup import format_followup_response, get_followup_questions
 from pipeline.forms import apply_form_filters
 from pipeline.gemini import call_structured_clinical
 from pipeline.grounding import verify_ingredient_matches
 from pipeline.retrieval import retrieve_for_targets
+from pipeline.red_flags import (
+    format_red_flag_screening_response,
+    get_red_flag_screening_questions,
+)
 from pipeline.safety import apply_safety_filters
 from pipeline.safety_intake import (
     assess_safety_intake,
@@ -67,6 +72,29 @@ def _block_medications_without_safety(ctx, full_text, history, query, session) -
     return None
 
 
+def _symptom_clarification_response(ctx, full_text, history, session) -> str | None:
+    """Ask targeted clinical questions before letting the LLM diagnose."""
+    assessment = ctx.to_assessment() if hasattr(ctx, "to_assessment") else None
+    if assessment is None:
+        from pipeline.context import patient_context_to_assessment
+
+        assessment = patient_context_to_assessment(ctx)
+
+    red_flag_questions = get_red_flag_screening_questions(ctx, full_text, session=session)
+    if red_flag_questions:
+        return format_red_flag_screening_response(red_flag_questions)
+
+    questions = get_followup_questions(
+        full_text,
+        assessment,
+        history=history,
+        session=session,
+    )
+    if questions:
+        return format_followup_response(questions)
+    return None
+
+
 def _handle_needs_info(clinical, full_text, history, query, ctx, session) -> str:
     """One-shot response for critical safety gaps — no conversational fallback."""
     if clinical.patient_message_ar:
@@ -94,15 +122,20 @@ def rag(query: str, history: list) -> str:
     if gate:
         return gate
 
+    safety_block = _block_medications_without_safety(
+        ctx, full_text, history, query, session,
+    )
+    if safety_block:
+        return safety_block
+
+    clarification = _symptom_clarification_response(ctx, full_text, history, session)
+    if clarification:
+        return clarification
+
     if temporary_override:
         preg = _pregnancy_block(ctx, query)
         if preg:
             return preg
-        med_block = _block_medications_without_safety(
-            ctx, full_text, history, query, session,
-        )
-        if med_block:
-            return med_block
 
         clinical, status = call_structured_clinical(
             query, history, ctx, temporary_override=True,
@@ -148,11 +181,6 @@ def rag(query: str, history: list) -> str:
     preg = _pregnancy_block(ctx, query)
     if preg:
         return preg
-    med_block = _block_medications_without_safety(
-        ctx, full_text, history, query, session,
-    )
-    if med_block:
-        return med_block
 
     matches, safety_notes = _finalize_matches(clinical, targets)
     return format_final_response(clinical, matches, safety_notes, full_text)
