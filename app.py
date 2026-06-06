@@ -539,7 +539,7 @@ def parse_clinical_plan(raw_text: str) -> ClinicalPlan:
 
 CSV_PATH         = os.getenv("EGYPT_DRUGS_CSV",    "egypt_drugs_cleaned_utf8.csv")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH",   "faiss.index")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L3-v2")
 
 index:       Optional[faiss.Index]         = None
 embed_model: Optional[SentenceTransformer] = None
@@ -564,17 +564,7 @@ try:
     print(f"✅ FAISS index loaded — {index.ntotal} vectors")
 
     # ③ Load SentenceTransformer weights ONCE (used only to encode short queries)
-    import psutil
-    print(f"🧠 RAM before model load: {psutil.Process().memory_info().rss / 1024**2:.0f} MB")
-    print("🔵 About to load SentenceTransformer")
-    try:
-        embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-        print("🟢 SentenceTransformer loaded successfully")
-    except Exception as e:
-        import traceback
-        print("🔴 SentenceTransformer failed")
-        traceback.print_exc()
-        raise
+    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
     print("✅ SentenceTransformer ready — startup complete, no dataset encoding performed")
 
 except FileNotFoundError as e:
