@@ -564,7 +564,17 @@ try:
     print(f"✅ FAISS index loaded — {index.ntotal} vectors")
 
     # ③ Load SentenceTransformer weights ONCE (used only to encode short queries)
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    import psutil
+    print(f"🧠 RAM before model load: {psutil.Process().memory_info().rss / 1024**2:.0f} MB")
+    print("🔵 About to load SentenceTransformer")
+    try:
+        embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        print("🟢 SentenceTransformer loaded successfully")
+    except Exception as e:
+        import traceback
+        print("🔴 SentenceTransformer failed")
+        traceback.print_exc()
+        raise
     print("✅ SentenceTransformer ready — startup complete, no dataset encoding performed")
 
 except FileNotFoundError as e:
