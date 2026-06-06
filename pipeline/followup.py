@@ -136,8 +136,15 @@ def get_followup_questions(full_text: str, assessment: ClinicalAssessment) -> li
     return unique[:MAX_FOLLOWUP_QUESTIONS]
 
 
-def information_sufficient_for_dx(full_text: str, assessment: ClinicalAssessment) -> bool:
+def information_sufficient_for_dx(
+    full_text: str,
+    assessment: ClinicalAssessment,
+    *,
+    safety_intake_done: bool = True,
+) -> bool:
     """True when enough clinical detail exists to proceed to differential diagnosis."""
+    if not safety_intake_done:
+        return False
     return len(get_followup_questions(full_text, assessment)) == 0
 
 

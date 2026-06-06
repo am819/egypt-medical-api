@@ -265,9 +265,8 @@ def extract_context(query: str, history: list) -> PatientContext:
     fever_text = fever_match.group(1).strip() if fever_match else ""
     allergies = extract_list_after_keywords(
         full_text, ["حساسيه", "allergy", "allergies", "allergic to"],
+        check_negation=False,
     )
-    if has_negation_response(full_text) and not any(k in norm for k in ["حساسيه", "allergy"]):
-        allergies = []
     current_meds = extract_list_after_keywords(
         full_text, ["ادويه", "ادوية", "meds", "medications", "باخد", "باخد علاج"],
     )
@@ -311,33 +310,14 @@ def is_greeting(text: str) -> bool:
 
 
 def intake_gate(ctx: PatientContext, history: list, query: str) -> Optional[str]:
+    """Emergency and greeting handling only — mandatory safety intake is in safety_intake.py."""
     if has_real_emergency(ctx):
         return "🚨 فيه علامات خطر حقيقية - لازم تروح الطوارئ فوراً."
     if is_greeting(query) and ctx.age is None and not ctx.symptoms:
-        return "أهلاً بك! أنا دكتور مساعد. عرفني على أعراضك عشان أقدر أساعدك. قولي السن والجنس."
-    if ctx.chronic_conditions:
-        return None
-    missing = []
-    if ctx.age is None:
-        missing.append("السن")
-    if ctx.sex == "unknown":
-        missing.append("الجنس (ذكر/أنثى)")
-    if ctx.sex == "female" and ctx.age is not None and ctx.age >= 18:
-        if ctx.pregnant is None and ctx.breastfeeding is None:
-            preg_latest, breast_latest = parse_pregnancy_breastfeeding(query)
-            if preg_latest is not None:
-                ctx.pregnant = preg_latest
-            if breast_latest is not None:
-                ctx.breastfeeding = breast_latest
-            if ctx.pregnant is None or ctx.breastfeeding is None:
-                missing.append("هل أنت حامل أو مرضع؟")
-    elif ctx.sex == "female" and ctx.age is not None and ctx.age < 18:
-        if ctx.pregnant is None:
-            ctx.pregnant = False
-        if ctx.breastfeeding is None:
-            ctx.breastfeeding = False
-    if missing:
-        return "عشان أساعدك، قولي " + " و ".join(missing) + "."
+        return (
+            "أهلاً بك! أنا دكتور مساعد. عرفني على أعراضك عشان أقدر أساعدك.\n\n"
+            "قبل أي تقييم، محتاج أعرف: السن، الجنس، الأمراض المزمنة، الحساسية، والأدوية الحالية."
+        )
     return None
 
 
