@@ -72,6 +72,8 @@ def _load_gemini_api_keys() -> list:
 
 GEMINI_API_KEYS: list = _load_gemini_api_keys()
 GEMINI_MODEL          = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SEC    = int(os.getenv("GEMINI_TIMEOUT_SEC", "25"))
+CHAT_TIMEOUT_SEC      = int(os.getenv("CHAT_TIMEOUT_SEC", "50"))
 RPM_LIMIT             = 10
 MIN_INTERVAL          = 60.0 / RPM_LIMIT
 _last_call_time: float = 0.0
@@ -470,6 +472,11 @@ def intake_gate(ctx: PatientContext, history: list, query: str) -> Optional[str]
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑥ GEMINI API CALL
 # ══════════════════════════════════════════════════════════════════════════════
+def _trim_history_for_gemini(history: list, max_messages: int = 10) -> list:
+    h = history or []
+    return h if len(h) <= max_messages else h[-max_messages:]
+
+
 def _gemini_key_exhausted(error: dict) -> bool:
     code = error.get("code")
     if code in (429, 403):
@@ -494,61 +501,52 @@ def call_gemini(messages: list):
         "contents": messages,
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
     }
-    n_keys      = len(GEMINI_API_KEYS)
-    keys_tried  = 0
-    switch_key  = False
+    n_keys = len(GEMINI_API_KEYS)
 
-    while keys_tried < n_keys:
+    for key_attempt in range(n_keys):
         api_key = GEMINI_API_KEYS[_gemini_key_index]
         headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-        switch_key = False
-
-        for attempt in range(3):
-            try:
-                _last_call_time = time.time()
-                r    = requests.post(url, headers=headers, json=payload, timeout=45)
-                resp = r.json()
-                if "error" in resp:
-                    err = resp["error"]
-                    print(f"❌ Gemini API error (key {_gemini_key_index + 1}/{n_keys}): {err}")
-                    if _gemini_key_exhausted(err):
-                        if attempt == 0:
-                            time.sleep(3)
-                            continue
-                        switch_key = True
-                        break
-                    return None, "gemini_error"
-                candidates = resp.get("candidates") or []
-                if not candidates:
-                    print(f"❌ Gemini empty response (key {_gemini_key_index + 1}): {resp}")
-                    if attempt < 2:
-                        time.sleep(3)
-                        continue
-                    switch_key = True
-                    break
-                parts = candidates[0].get("content", {}).get("parts") or []
-                if not parts or "text" not in parts[0]:
-                    print(f"❌ Gemini missing text (key {_gemini_key_index + 1}): {resp}")
-                    if attempt < 2:
-                        time.sleep(3)
-                        continue
-                    switch_key = True
-                    break
-                text = parts[0]["text"].strip()
-                text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
-                text = re.sub(r'\(Response.*?\):\s*', '', text)
-                return text, GEMINI_MODEL
-            except Exception as e:
-                print(f"❌ Gemini call exception (key {_gemini_key_index + 1}, attempt {attempt + 1}): {e}")
-                time.sleep(5)
-
-        if not switch_key:
-            break
-
-        _gemini_key_index = (_gemini_key_index + 1) % n_keys
-        keys_tried += 1
-        if keys_tried < n_keys:
-            print(f"🔑 Switching to Gemini API key {_gemini_key_index + 1}/{n_keys}")
+        try:
+            _last_call_time = time.time()
+            r    = requests.post(url, headers=headers, json=payload, timeout=GEMINI_TIMEOUT_SEC)
+            resp = r.json()
+            if "error" in resp:
+                err = resp["error"]
+                print(f"❌ Gemini API error (key {_gemini_key_index + 1}/{n_keys}): {err}")
+                if _gemini_key_exhausted(err) and key_attempt < n_keys - 1:
+                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                    print(f"🔑 Switching to Gemini API key {_gemini_key_index + 1}/{n_keys}")
+                    continue
+                if _gemini_key_exhausted(err):
+                    return None, "rate_limit"
+                return None, "gemini_error"
+            candidates = resp.get("candidates") or []
+            if not candidates:
+                print(f"❌ Gemini empty response (key {_gemini_key_index + 1}): {resp}")
+                if key_attempt < n_keys - 1:
+                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                    continue
+                return None, "rate_limit"
+            parts = candidates[0].get("content", {}).get("parts") or []
+            if not parts or "text" not in parts[0]:
+                print(f"❌ Gemini missing text (key {_gemini_key_index + 1}): {resp}")
+                if key_attempt < n_keys - 1:
+                    _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                    continue
+                return None, "rate_limit"
+            text = parts[0]["text"].strip()
+            text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
+            text = re.sub(r'\(Response.*?\):\s*', '', text)
+            return text, GEMINI_MODEL
+        except requests.Timeout:
+            print(f"❌ Gemini timeout (key {_gemini_key_index + 1}/{n_keys})")
+            if key_attempt < n_keys - 1:
+                _gemini_key_index = (_gemini_key_index + 1) % n_keys
+                continue
+            return None, "rate_limit"
+        except Exception as e:
+            print(f"❌ Gemini call exception (key {_gemini_key_index + 1}): {e}")
+            return None, "gemini_error"
 
     return None, "rate_limit"
 
@@ -872,7 +870,7 @@ def rag(query: str, history: list) -> str:
         gemini_messages = [
             {"role": "user" if m["role"] == "user" else "model",
              "parts": [{"text": m["content"]}]}
-            for m in history
+            for m in _trim_history_for_gemini(history)
         ]
         augmented = (
             build_patient_summary(ctx) +
@@ -904,7 +902,7 @@ def rag(query: str, history: list) -> str:
     gemini_messages = [
         {"role": "user" if m["role"] == "user" else "model",
          "parts": [{"text": m["content"]}]}
-        for m in history
+        for m in _trim_history_for_gemini(history)
     ]
     augmented = build_patient_summary(ctx) + "\nسؤال المريض الحالي:\n" + query.strip()
     gemini_messages.append({"role": "user", "parts": [{"text": augmented}]})
@@ -990,13 +988,20 @@ async def chat_endpoint(body: ChatRequest):
             return rag(body.message, body.history)
 
     try:
-        response_text = await asyncio.to_thread(_run_rag)
+        response_text = await asyncio.wait_for(
+            asyncio.to_thread(_run_rag),
+            timeout=CHAT_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        print("❌ /chat timed out")
+        return ChatResponse(
+            response="معلش، الطلب أخد وقت طويل — استنى شوية وحاول تاني."
+        )
     except Exception as e:
         print(f"❌ /chat unhandled error: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail="السيرفر مشغول دلوقتي — استنى شوية وحاول تاني",
-        ) from e
+        return ChatResponse(
+            response="عذراً، حدث خطأ مؤقت — حاول تاني بعد شوية."
+        )
 
     return ChatResponse(response=response_text)
 
@@ -1008,6 +1013,7 @@ def health_check():
         "status": "ok",
         "index_loaded": index is not None,
         "drug_count": len(df) if not df.empty else 0,
+        "gemini_keys_loaded": len(GEMINI_API_KEYS),
     }
 
 

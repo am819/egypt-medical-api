@@ -128,10 +128,9 @@ async function send() {
       body: JSON.stringify({ message: msg, history })
     });
     if (!res.ok) {
-      if (res.status === 502 || res.status === 503) {
-        throw new Error("السيرفر مشغول أو الطلب أخد وقت طويل — استنى 10 ثواني وحاول تاني");
-      }
-      throw new Error("HTTP " + res.status);
+      throw new Error(res.status === 502 || res.status === 503
+        ? "السيرفر مشغول — استنى شوية وحاول تاني"
+        : "HTTP " + res.status);
     }
     const data = await res.json();
     removeTyping();
