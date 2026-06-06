@@ -31,9 +31,11 @@ Required files next to app.py (generate with build_index.py):
 # ──────────────────────────────────────────────────────────────────────────────
 # STANDARD IMPORTS
 # ──────────────────────────────────────────────────────────────────────────────
+import asyncio
 import os
 import re
 import time
+from threading import Lock
 import requests
 import pandas as pd
 from dataclasses import dataclass, field
@@ -74,6 +76,7 @@ RPM_LIMIT             = 10
 MIN_INTERVAL          = 60.0 / RPM_LIMIT
 _last_call_time: float = 0.0
 _gemini_key_index: int = 0
+_rag_lock = Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -509,13 +512,29 @@ def call_gemini(messages: list):
                     err = resp["error"]
                     print(f"❌ Gemini API error (key {_gemini_key_index + 1}/{n_keys}): {err}")
                     if _gemini_key_exhausted(err):
-                        if attempt < 2:
-                            time.sleep(10)
+                        if attempt == 0:
+                            time.sleep(3)
                             continue
                         switch_key = True
                         break
                     return None, "gemini_error"
-                text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+                candidates = resp.get("candidates") or []
+                if not candidates:
+                    print(f"❌ Gemini empty response (key {_gemini_key_index + 1}): {resp}")
+                    if attempt < 2:
+                        time.sleep(3)
+                        continue
+                    switch_key = True
+                    break
+                parts = candidates[0].get("content", {}).get("parts") or []
+                if not parts or "text" not in parts[0]:
+                    print(f"❌ Gemini missing text (key {_gemini_key_index + 1}): {resp}")
+                    if attempt < 2:
+                        time.sleep(3)
+                        continue
+                    switch_key = True
+                    break
+                text = parts[0]["text"].strip()
                 text = re.sub(r'\(Internal Reasoning\).*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
                 text = re.sub(r'\(Response.*?\):\s*', '', text)
                 return text, GEMINI_MODEL
@@ -965,7 +984,20 @@ async def chat_endpoint(body: ChatRequest):
     """
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
-    response_text = rag(body.message, body.history)
+
+    def _run_rag():
+        with _rag_lock:
+            return rag(body.message, body.history)
+
+    try:
+        response_text = await asyncio.to_thread(_run_rag)
+    except Exception as e:
+        print(f"❌ /chat unhandled error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="السيرفر مشغول دلوقتي — استنى شوية وحاول تاني",
+        ) from e
+
     return ChatResponse(response=response_text)
 
 

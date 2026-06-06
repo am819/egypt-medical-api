@@ -74,7 +74,7 @@ textarea:focus { border-color: #00c89660; }
 </footer>
 
 <script>
-const API = "https://egypt-medical-api-production.up.railway.app/chat";
+const API = "/chat";
 let history = [];
 let loading = false;
 const msgsEl = document.getElementById("msgs");
@@ -127,7 +127,12 @@ async function send() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: msg, history })
     });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      if (res.status === 502 || res.status === 503) {
+        throw new Error("السيرفر مشغول أو الطلب أخد وقت طويل — استنى 10 ثواني وحاول تاني");
+      }
+      throw new Error("HTTP " + res.status);
+    }
     const data = await res.json();
     removeTyping();
     addBubble(data.response, "bot");
