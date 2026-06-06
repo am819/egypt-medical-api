@@ -328,8 +328,8 @@ def intake_gate(ctx: PatientContext, history: list, query: str) -> Optional[str]
         return "🚨 فيه علامات خطر حقيقية - لازم تروح الطوارئ فوراً."
     if is_greeting(query) and ctx.age is None and not ctx.symptoms:
         return (
-            "أهلاً بك! أنا دكتور مساعد. عرفني على أعراضك عشان أقدر أساعدك.\n\n"
-            "قبل أي تقييم، محتاج أعرف: السن، الجنس، الأمراض المزمنة، الحساسية، والأدوية الحالية."
+            "أهلاً بك! أنا صيدلي مساعد. احكيلي أعراضك عشان أقدر أساعدك.\n\n"
+            "قولي السن والجنس، ولو في أمراض مزمنة أو حساسية من أدوية."
         )
     return None
 
