@@ -10,14 +10,12 @@ Startup architecture (Railway-compatible — no OOM)
 Embeddings and the FAISS index are generated OFFLINE (once) using
 build_index.py, then committed to the repository as:
 
-    embeddings.npy   — float32 array, shape (N, D)
     faiss.index      — binary FAISS IndexFlatIP file
 
 At startup this service does:
   1. Read egypt_drugs_cleaned_utf8.csv              (~instant)
-  2. Load embeddings.npy with np.load()             (~instant, file I/O)
-  3. Load faiss.index with faiss.read_index()       (~instant, file I/O)
-  4. Load SentenceTransformer weights               (~5–15 s, once)
+  2. Load faiss.index with faiss.read_index()       (~instant, file I/O)
+  3. Load SentenceTransformer weights               (~5–15 s, once)
 
 It does NOT call embed_model.encode() on the dataset — ever.
 Per-request cost: encode one short query string (~1–5 tokens).
@@ -27,7 +25,6 @@ Run with:
 
 Required files next to api.py (generate with build_index.py):
     egypt_drugs_cleaned_utf8.csv
-    embeddings.npy
     faiss.index
 """
 
@@ -39,7 +36,6 @@ import re
 import time
 import requests
 import pandas as pd
-import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
@@ -539,11 +535,9 @@ def parse_clinical_plan(raw_text: str) -> ClinicalPlan:
 #
 # Required files (commit to repo alongside api.py):
 #   egypt_drugs_cleaned_utf8.csv  — drug database
-#   embeddings.npy                — float32 (N, D) produced by build_index.py
 #   faiss.index                   — IndexFlatIP produced by build_index.py
 
 CSV_PATH         = os.getenv("EGYPT_DRUGS_CSV",    "egypt_drugs_cleaned_utf8.csv")
-EMBEDDINGS_PATH  = os.getenv("EMBEDDINGS_PATH",    "embeddings.npy")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH",   "faiss.index")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
@@ -565,21 +559,17 @@ try:
     df = df_raw.reset_index(drop=True)
     print(f"✅ CSV loaded — {len(df)} rows")
 
-    # ② Load precomputed embeddings — np.load(), no encode()
-    emb = np.load(EMBEDDINGS_PATH).astype("float32")
-    print(f"✅ Embeddings loaded — shape {emb.shape}")
-
-    # ③ Load precomputed FAISS index — faiss.read_index(), no rebuild
+    # ② Load precomputed FAISS index — faiss.read_index(), no rebuild
     index = faiss.read_index(FAISS_INDEX_PATH)
     print(f"✅ FAISS index loaded — {index.ntotal} vectors")
 
-    # ④ Load SentenceTransformer weights ONCE (used only to encode short queries)
+    # ③ Load SentenceTransformer weights ONCE (used only to encode short queries)
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
     print("✅ SentenceTransformer ready — startup complete, no dataset encoding performed")
 
 except FileNotFoundError as e:
     print(f"❌ Missing precomputed file: {e}")
-    print("   Run build_index.py offline to generate embeddings.npy and faiss.index")
+    print("   Run build_index.py offline to generate faiss.index")
 except Exception as e:
     print(f"❌ Startup error: {e}")
 
