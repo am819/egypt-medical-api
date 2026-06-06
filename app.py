@@ -58,7 +58,7 @@ import uvicorn
 # ══════════════════════════════════════════════════════════════════════════════
 # ① GEMINI CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBfJepzZNH7oln3DNf4zAd5yGGDRZyYBxA")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 RPM_LIMIT      = 10
 MIN_INTERVAL   = 60.0 / RPM_LIMIT
