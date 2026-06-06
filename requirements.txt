@@ -1,27 +1,36 @@
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Requirements for the Egyptian Medical AI API
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 # Web framework
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 
-# HTTP client (used to call Gemini)
+# HTTP client (Gemini calls)
 requests>=2.31.0
 
 # Data handling
 pandas>=2.2.0
 numpy>=1.26.0
 
-# Embeddings model (weights loaded once at startup; no bulk encode)
+# Embeddings — model loaded once at startup to encode short queries only
 sentence-transformers>=2.7.0
 
-# Fuzzy string matching — replaces FAISS for drug lookup
+# Vector search — index loaded from precomputed faiss.index at startup
+faiss-cpu>=1.8.0
+
+# Fuzzy matching — used as fallback if FAISS index is unavailable
 rapidfuzz>=3.6.0
 
 # Pydantic (FastAPI dependency)
 pydantic>=2.7.0
 
-# NOTE: faiss-cpu has been intentionally removed.
-# Drug retrieval now uses rapidfuzz directly on the ingredient text column,
-# avoiding the 26 000-row bulk encode that caused OOM crashes on Railway.
+# ──────────────────────────────────────────────────────────────
+# Notes
+# ──────────────────────────────────────────────────────────────
+# The build_index.py script (run offline / on Colab) requires the same
+# packages above. No extra dependencies are needed.
+#
+# Railway deployment no longer calls embed_model.encode() on the full
+# dataset at startup. The precomputed embeddings.npy and faiss.index
+# are loaded from disk in milliseconds.
