@@ -4,7 +4,18 @@ import json
 import re
 from typing import Optional
 
-from pipeline.context import PatientContext, dedupe_keep_order, patient_context_to_assessment
+from pipeline.context import (
+    CONDITION_KEYWORDS,
+    PatientContext,
+    dedupe_keep_order,
+    normalize_text,
+    patient_context_to_assessment,
+)
+from pipeline.clinical_gates import (
+    MIN_COMPLETENESS_FOR_CONFIDENCE,
+    MIN_COMPLETENESS_FOR_DX,
+    MIN_COMPLETENESS_FOR_MEDS,
+)
 from pipeline.followup import compute_info_completeness
 from pipeline.models import (
     ClinicalAssessment,
@@ -26,6 +37,22 @@ _SPECIFIC_TO_BROAD: list[tuple[str, str]] = [
 ]
 
 
+def _normalize_chronic_diseases(conditions: list[str]) -> list[str]:
+    """Map Arabic/English chronic labels to canonical keys."""
+    canonical: list[str] = []
+    for cond in conditions:
+        norm = normalize_text(cond)
+        matched = False
+        for key, kws in CONDITION_KEYWORDS.items():
+            if norm == key or any(normalize_text(k) in norm for k in kws):
+                canonical.append(key)
+                matched = True
+                break
+        if not matched and cond.strip():
+            canonical.append(cond.strip())
+    return dedupe_keep_order(canonical)
+
+
 def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> ClinicalAssessment:
     """Merge regex baseline with LLM assessment; regex red flags are never dropped."""
     base = patient_context_to_assessment(regex_ctx)
@@ -37,7 +64,9 @@ def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> Clin
         regex_ctx.breastfeeding if regex_ctx.breastfeeding is not None else llm.breastfeeding
     )
 
-    chronic = dedupe_keep_order(base.chronic_diseases + llm.chronic_diseases)
+    chronic = _normalize_chronic_diseases(
+        dedupe_keep_order(base.chronic_diseases + llm.chronic_diseases)
+    )
     allergies = dedupe_keep_order(base.drug_allergies + llm.drug_allergies)
     meds = dedupe_keep_order(base.current_medications + llm.current_medications)
     main_symptoms = dedupe_keep_order(base.main_symptoms + llm.main_symptoms)
@@ -64,6 +93,36 @@ def merge_assessment(regex_ctx: PatientContext, llm: ClinicalAssessment) -> Clin
         diarrhea_blood=regex_ctx.diarrhea_blood or llm.diarrhea_blood,
         diarrhea_fever=regex_ctx.diarrhea_fever or llm.diarrhea_fever,
     )
+
+
+def min_confidence(conf: str) -> str:
+    return "medium" if conf == "high" else conf
+
+
+def _has_supporting_evidence(
+    condition: str,
+    assessment: ClinicalAssessment,
+    full_text: str,
+    completeness: float,
+) -> bool:
+    """Confidence requires symptoms + duration + context, not label alone."""
+    if completeness < MIN_COMPLETENESS_FOR_CONFIDENCE:
+        return False
+    if not assessment.main_symptoms:
+        return False
+    if not assessment.symptom_duration and "يوم" not in full_text and "ساع" not in full_text:
+        return False
+    lowered = condition.lower()
+    symptom_text = " ".join(assessment.main_symptoms).lower()
+    if "respiratory" in lowered or "pharyng" in lowered:
+        return any(s in symptom_text for s in ["كحة", "كحه", "رشح", "حلق", "زكام"])
+    if "gastro" in lowered or "intestinal" in lowered:
+        return any(s in symptom_text for s in ["بطن", "اسهال", "إسهال", "قيء", "ترجيع", "مغص"])
+    if "skin" in lowered or "dermat" in lowered:
+        return any(s in symptom_text for s in ["طفح", "هرش", "حساسية"])
+    if "headache" in lowered:
+        return "صداع" in symptom_text
+    return completeness >= 0.85
 
 
 def _broaden_condition(condition: str, completeness: float) -> str:
@@ -97,12 +156,17 @@ def calibrate_differential(
         )
 
         conf = raw_conf
-        if completeness < 0.5:
+        if completeness < MIN_COMPLETENESS_FOR_DX:
             conf = "low"
-        elif completeness < 0.75 and conf == "high":
+        elif completeness < MIN_COMPLETENESS_FOR_CONFIDENCE:
+            conf = "low" if raw_conf == "high" else min_confidence(raw_conf)
+        elif completeness < 0.85 and conf == "high":
             conf = "medium"
-        elif conf == "high" and completeness < 0.85:
-            conf = "medium"
+
+        if conf in ("medium", "high") and not _has_supporting_evidence(
+            cond, assessment, full_text, completeness,
+        ):
+            conf = "low"
 
         calibrated_confidences.append(conf)
         calibrated_conditions.append(_broaden_condition(cond, completeness))
@@ -125,13 +189,30 @@ def enrich_clinical_result(
     assessment = result.assessment.model_copy(update={"red_flags": merged_flags})
     differential = calibrate_differential(result.differential, assessment, full_text)
 
+    completeness = compute_info_completeness(full_text, assessment)
     status = result.status
-    if status == "ready" and compute_info_completeness(full_text, assessment) < 0.4:
+    targets = list(result.therapeutic_targets)
+
+    if completeness < MIN_COMPLETENESS_FOR_DX:
+        status = "needs_info"
+        differential = DifferentialDiagnosis(
+            possible_conditions=[],
+            confidence_levels=[],
+            red_flag_assessment=differential.red_flag_assessment,
+            requires_urgent_care=differential.requires_urgent_care,
+        )
+        targets = []
+
+    if completeness < MIN_COMPLETENESS_FOR_MEDS:
+        targets = []
+
+    if status == "ready" and completeness < MIN_COMPLETENESS_FOR_DX:
         status = "needs_info"
 
     return result.model_copy(update={
         "assessment": assessment,
         "differential": differential,
+        "therapeutic_targets": targets,
         "status": status,
     })
 
