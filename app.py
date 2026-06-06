@@ -50,6 +50,7 @@ from rapidfuzz import process
 # FASTAPI IMPORTS
 # ──────────────────────────────────────────────────────────────────────────────
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -541,7 +542,7 @@ def parse_clinical_plan(raw_text: str) -> ClinicalPlan:
 
 CSV_PATH         = os.getenv("EGYPT_DRUGS_CSV",    "egypt_drugs_cleaned_utf8.csv")
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH",   "faiss.index")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L3-v2")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME",   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 index:       Optional[faiss.Index]         = None
 embed_model: Optional[SentenceTransformer] = None
@@ -908,6 +909,11 @@ class ChatResponse(BaseModel):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/", include_in_schema=False)
+def serve_ui():
+    return FileResponse("index.html")
+
+
 @app.post("/chat", response_model=ChatResponse, summary="Send a message and receive an AI response")
 async def chat_endpoint(body: ChatRequest):
     """
