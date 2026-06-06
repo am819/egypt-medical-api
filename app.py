@@ -557,15 +557,17 @@ try:
             df_raw.get(INGREDIENT_COL, pd.Series([""] * len(df_raw)))
         )
     df = df_raw.reset_index(drop=True)
+    del df_raw  # release duplicate DataFrame memory before loading index
+    import gc; gc.collect()
     print(f"✅ CSV loaded — {len(df)} rows")
 
     # ② Load precomputed FAISS index — faiss.read_index(), no rebuild
     index = faiss.read_index(FAISS_INDEX_PATH)
     print(f"✅ FAISS index loaded — {index.ntotal} vectors")
 
-    # ③ Load SentenceTransformer weights ONCE (used only to encode short queries)
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-    print("✅ SentenceTransformer ready — startup complete, no dataset encoding performed")
+    # ③ SentenceTransformer is lazy-loaded on first request (see get_embed_model())
+    #    to avoid OOM during startup on memory-constrained hosts.
+    print("✅ Startup complete — SentenceTransformer will load on first request")
 
 except FileNotFoundError as e:
     print(f"❌ Missing precomputed file: {e}")
@@ -628,6 +630,16 @@ def caution_notes_for_context(active_ingredient: str, ctx: PatientContext) -> li
     return dedupe_keep_order(notes)
 
 
+def get_embed_model() -> Optional[SentenceTransformer]:
+    """Lazy-load SentenceTransformer on first call to avoid startup OOM."""
+    global embed_model
+    if embed_model is None:
+        print(f"🔵 Loading SentenceTransformer ({EMBED_MODEL_NAME})…")
+        embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        print("🟢 SentenceTransformer ready")
+    return embed_model
+
+
 def semantic_candidate_indices(query_text: str, top_k: int = 40) -> list:
     """
     Encode query_text with SentenceTransformer (one short string, ~ms),
@@ -644,10 +656,10 @@ def semantic_candidate_indices(query_text: str, top_k: int = 40) -> list:
         return []
 
     # ── Semantic path (preferred) ────────────────────────────────────────────
-    if index is not None and embed_model is not None:
+    if index is not None and get_embed_model() is not None:
         try:
             # Encode only the short query string — NOT the dataset
-            q = embed_model.encode([query_text]).astype("float32")
+            q = get_embed_model().encode([query_text]).astype("float32")
             faiss.normalize_L2(q)
             _scores, ids = index.search(q, min(top_k, index.ntotal))
             return [int(i) for i in ids[0] if i >= 0]
